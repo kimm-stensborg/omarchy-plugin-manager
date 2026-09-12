@@ -1,0 +1,431 @@
+#!/bin/bash
+
+# Plugin Manager backend. The overlay and the bar widget never touch the system
+# themselves: every command here prints exactly one JSON document on stdout.
+# The actions are thin wrappers over the stock omarchy-plugin-* binaries, so
+# cloning, validation, rollback and shell rescans stay Omarchy's business.
+#
+#   plugin-manager list
+#   plugin-manager check [id] [--if-stale SECONDS]
+#   plugin-manager update <id>
+#   plugin-manager remove <id>
+#   plugin-manager add <git-url>
+#   plugin-manager enable <id>
+#   plugin-manager disable <id>
+#   plugin-manager run --label L --id ID --kind K -- <command...>
+#
+# Only plugins under ~/.config/omarchy/plugins are managed -- built-in omarchy.*
+# plugins can be neither updated nor removed -- and never the manager itself.
+
+set -uo pipefail
+
+SELF_ID="io.github.kimm-stensborg.plugin-manager"
+PLUGINS_DIR="$HOME/.config/omarchy/plugins"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/plugin-manager"
+CACHE="$CACHE_DIR/updates.json"
+MAX_COMMITS=20
+
+# The same non-interactive git as omarchy-plugin-update: a fetch has to fail
+# rather than wait for a password nobody can type into an overlay.
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
+
+# ------------------------------------------------------------------ output
+
+# reply <ok> <message> [output] [extra-json]
+reply() {
+  local extra="${4:-}"
+  [[ -n $extra ]] || extra='{}'
+  jq -cn --argjson ok "$1" --arg message "$2" --arg output "${3:-}" --argjson extra "$extra" \
+    '{ok: $ok, message: $message, output: $output} + $extra'
+}
+
+fail() {
+  reply false "$1"
+  exit 1
+}
+
+last_line() {
+  awk 'NF { line = $0 } END { print line }' <<<"$1"
+}
+
+# ------------------------------------------------------------------- ids
+
+valid_id() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != *..* ]]
+}
+
+# An installed plugin the manager may act on: anything in the plugin directory
+# except the manager itself.
+require_managed() {
+  local id="$1"
+  [[ -n $id ]] || fail "a plugin id is required"
+  valid_id "$id" || fail "invalid plugin id '$id'"
+  [[ $id != "$SELF_ID" ]] || fail "the plugin manager does not manage itself"
+  [[ -e $PLUGINS_DIR/$id || -L $PLUGINS_DIR/$id ]] || fail "plugin '$id' is not installed"
+}
+
+# Folder names, which are what omarchy-plugin-update and -remove take. Dot
+# folders are the add/remove staging and backup directories.
+managed_ids() {
+  [[ -d $PLUGINS_DIR ]] || return 0
+  find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) ! -name '.*' -printf '%f\n' |
+    { grep -vxF "$SELF_ID" || true; } |
+    sort
+}
+
+# ------------------------------------------------------------------ cache
+
+read_cache() {
+  if [[ -s $CACHE ]] && jq -e 'type == "object"' "$CACHE" >/dev/null 2>&1; then
+    cat "$CACHE"
+  else
+    echo '{"plugins":{}}'
+  fi
+}
+
+# update_cache [jq-args...] <filter> -- applies filter to the cache under a
+# lock, since the overlay and a bar widget per monitor can all write it.
+#
+# The new content is built aside but written over the old file rather than
+# renamed onto it: the bar widget's FileView watches the file, and a rename
+# swaps the inode out from under the watch so the badge never hears of it.
+update_cache() {
+  mkdir -p "$CACHE_DIR"
+  (
+    flock 9
+    tmp=$(mktemp "$CACHE_DIR/.updates.XXXXXX")
+    if read_cache | jq "$@" >"$tmp"; then
+      cat "$tmp" >"$CACHE"
+    fi
+    rm -f "$tmp"
+  ) 9>"$CACHE_DIR/cache.lock"
+}
+
+# ------------------------------------------------------------------- list
+
+git_info() {
+  local dir="$1" remote branch line dirty=false
+  [[ -d $dir/.git ]] || {
+    echo null
+    return
+  }
+  remote=$(git -C "$dir" remote get-url origin 2>/dev/null)
+  branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  line=$(git -C "$dir" log -1 --format='%h%x1f%H%x1f%cI%x1f%s' 2>/dev/null)
+  # Untracked files do not stop a fast-forward; changed tracked files do.
+  [[ -z $(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null) ]] || dirty=true
+  jq -cn --arg remote "$remote" --arg branch "$branch" --arg line "$line" --argjson dirty "$dirty" '
+    ($line | split("\u001f")) as $c
+    | { remote: $remote, branch: $branch, commit: ($c[0] // ""), fullCommit: ($c[1] // ""),
+        date: ($c[2] // ""), subject: ($c[3] // ""), dirty: $dirty }'
+}
+
+plugin_json() {
+  local id="$1"
+  local dir="$PLUGINS_DIR/$1"
+  local manifest="$dir/manifest.json"
+  local source validation valid=true link="" m='{}'
+
+  if [[ -L $dir ]]; then
+    source=symlink
+    link=$(readlink -f "$dir")
+  elif [[ -d $dir/.git ]]; then
+    source=git
+  elif [[ -f $manifest ]] && jq -e '.omarchy.clonedFrom // empty' "$manifest" >/dev/null 2>&1; then
+    source=clone
+  else
+    source=local
+  fi
+
+  # The trailing slash makes the validator's `find -type l` look inside a
+  # symlinked plugin instead of reporting the link it was handed.
+  validation=$(omarchy-plugin-validate "$dir/" 2>&1) || valid=false
+  if [[ -f $manifest ]]; then
+    m=$(jq -c 'if type == "object" then . else {} end' "$manifest" 2>/dev/null) || m='{}'
+    [[ -n $m ]] || m='{}'
+  fi
+
+  jq -cn --arg id "$id" --arg dir "$dir" --arg source "$source" --arg link "$link" \
+    --argjson valid "$valid" --arg validation "${validation#omarchy-plugin-validate: }" \
+    --argjson m "$m" --argjson git "$(git_info "$dir")" '
+    def str(v): if (v | type) == "string" then v else "" end;
+    { id: $id,
+      manifestId: str($m.id),
+      name: (str($m.name) | if . == "" then $id else . end),
+      version: str($m.version),
+      author: str($m.author),
+      license: str($m.license),
+      description: str($m.description),
+      kinds: (if ($m.kinds | type) == "array" then $m.kinds else [] end),
+      clonedFrom: str($m.omarchy.clonedFrom?),
+      path: $dir,
+      linkTarget: $link,
+      source: $source,
+      valid: $valid,
+      validationError: (if $valid then "" else $validation end),
+      git: $git }'
+}
+
+cmd_list() {
+  local shell_plugins cache id
+  local items=()
+
+  # One call for every plugin's enabled bit. Without a running shell there is
+  # nothing to read it from, and every plugin reads as disabled.
+  shell_plugins=$(omarchy-shell shell listPlugins 2>/dev/null)
+  jq -e 'type == "array"' <<<"$shell_plugins" >/dev/null 2>&1 || shell_plugins='[]'
+  cache=$(read_cache)
+
+  while IFS= read -r id; do
+    [[ -n $id ]] && items+=("$(plugin_json "$id")")
+  done < <(managed_ids)
+
+  printf '%s\n' "${items[@]}" | jq -cs --argjson shell "$shell_plugins" --argjson cache "$cache" '
+    map(. as $p
+        | .enabled = any($shell[]; (.id == $p.id or .id == $p.manifestId) and .enabled == true)
+        | .update = ($cache.plugins[$p.id] // null))
+    | sort_by(.name | ascii_downcase)
+    | {ok: true, checkedAt: ($cache.checkedAt // null), plugins: .}'
+}
+
+# ------------------------------------------------------------------ check
+
+# check_one <id> [fetch] -- one cache entry. With fetch=0 it compares against
+# the FETCH_HEAD already on disk, which is what an update just left behind.
+check_one() {
+  local id="$1" fetch="${2:-1}"
+  local dir="$PLUGINS_DIR/$1"
+  local now err="" behind=0 ahead=0 commits='[]' version=""
+  now=$(date -Iseconds)
+
+  if [[ ! -d $dir/.git ]]; then
+    jq -cn --arg now "$now" \
+      '{checkable: false, behind: 0, ahead: 0, commits: [], remoteVersion: "", error: "", checkedAt: $now}'
+    return
+  fi
+
+  # The same fetch omarchy-plugin-update does, so "behind" here means exactly
+  # what an update would bring in.
+  if ((fetch)) && ! err=$(git -C "$dir" fetch --quiet origin HEAD 2>&1); then
+    # git's reason is its fatal: line; what follows is boilerplate such as
+    # "and the repository exists."
+    err=$(sed -n 's/^\(fatal\|error\): //p' <<<"$err" | head -n 1)
+    err="${err:-fetch failed}"
+  elif ! git -C "$dir" rev-parse -q --verify FETCH_HEAD >/dev/null; then
+    err="not checked yet"
+  else
+    err=""
+    behind=$(git -C "$dir" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || echo 0)
+    ahead=$(git -C "$dir" rev-list --count FETCH_HEAD..HEAD 2>/dev/null || echo 0)
+    commits=$(git -C "$dir" log -n "$MAX_COMMITS" --format='%h%x1f%cI%x1f%an%x1f%s' HEAD..FETCH_HEAD 2>/dev/null |
+      jq -cR 'split("\u001f") | {commit: .[0], date: .[1], author: .[2], subject: .[3]}' | jq -cs .)
+    version=$(git -C "$dir" show FETCH_HEAD:manifest.json 2>/dev/null | jq -r '.version // empty' 2>/dev/null)
+  fi
+
+  jq -cn --arg now "$now" --arg err "$err" --argjson behind "${behind:-0}" --argjson ahead "${ahead:-0}" \
+    --argjson commits "${commits:-[]}" --arg version "$version" '
+    {checkable: true, behind: $behind, ahead: $ahead, commits: $commits,
+     remoteVersion: $version, error: $err, checkedAt: $now}'
+}
+
+cmd_check() {
+  local only="" stale="" id at
+  while (($# > 0)); do
+    case "$1" in
+    --if-stale)
+      stale="${2:-}"
+      [[ $stale =~ ^[0-9]+$ ]] || fail "--if-stale needs a number of seconds"
+      shift 2
+      ;;
+    -*) fail "unknown check option: $1" ;;
+    *)
+      [[ -z $only ]] || fail "unexpected argument: $1"
+      only="$1"
+      shift
+      ;;
+    esac
+  done
+  [[ -z $only ]] || require_managed "$only"
+
+  # One check at a time. A bar widget on every monitor fires its timer at
+  # once; the second one waits here and then finds the cache fresh.
+  mkdir -p "$CACHE_DIR"
+  exec 8>"$CACHE_DIR/check.lock"
+  flock 8
+
+  if [[ -n $stale && -z $only ]]; then
+    at=$(read_cache | jq -r '.checkedAt // empty')
+    if [[ -n $at ]] && (($(date +%s) - $(date -d "$at" +%s 2>/dev/null || echo 0) < stale)); then
+      read_cache | jq -c '{ok: true} + .'
+      return
+    fi
+  fi
+
+  local ids=()
+  if [[ -n $only ]]; then
+    ids=("$only")
+  else
+    mapfile -t ids < <(managed_ids)
+  fi
+
+  # Fetch in parallel: each one is mostly waiting on the network.
+  local tmpd entries
+  tmpd=$(mktemp -d)
+  for id in "${ids[@]}"; do
+    check_one "$id" >"$tmpd/$id" &
+  done
+  wait
+  entries=$(for id in "${ids[@]}"; do jq -c --arg id "$id" '{($id): .}' "$tmpd/$id"; done | jq -cs 'add // {}')
+  rm -rf "$tmpd"
+
+  if [[ -n $only ]]; then
+    update_cache --argjson e "$entries" '.plugins = ((.plugins // {}) + $e)'
+  else
+    # A full check replaces the list, which drops plugins removed since.
+    update_cache --argjson e "$entries" --arg now "$(date -Iseconds)" '.plugins = $e | .checkedAt = $now'
+  fi
+  read_cache | jq -c '{ok: true} + .'
+}
+
+# ---------------------------------------------------------------- actions
+
+# run_stock <success-message> <id-for-reply> <command...>
+run_stock() {
+  local message="$1" id="$2" out
+  shift 2
+  if out=$("$@" 2>&1 </dev/null); then
+    reply true "${message:-$(last_line "$out")}" "$out" "$(jq -cn --arg id "$id" '{id: $id}')"
+  else
+    reply false "$(last_line "$out")" "$out" "$(jq -cn --arg id "$id" '{id: $id}')"
+    return 1
+  fi
+}
+
+cmd_update() {
+  local id="${1:-}"
+  require_managed "$id"
+  [[ -d $PLUGINS_DIR/$id/.git ]] || fail "'$id' is not a git checkout, so there is nothing to update from"
+  run_stock "" "$id" omarchy-plugin-update "$id" --yes || return 1
+  update_cache --arg id "$id" --argjson e "$(check_one "$id" 0)" '.plugins[$id] = $e'
+}
+
+cmd_remove() {
+  local id="${1:-}"
+  require_managed "$id"
+  run_stock "" "$id" omarchy-plugin-remove "$id" --yes || return 1
+  update_cache --arg id "$id" 'del(.plugins[$id])'
+}
+
+cmd_add() {
+  local url="${1:-}" out id
+  [[ -n $url ]] || fail "a git URL is required"
+  # Lands disabled: plugins run unsandboxed in omarchy-shell, and Omarchy's
+  # model is to read the code before switching it on.
+  if out=$(omarchy-plugin-add "$url" --yes 2>&1 </dev/null); then
+    id=$(sed -n 's/^Added \(.*\) into .*/\1/p' <<<"$out" | tail -n 1)
+    reply true "Added ${id:-the plugin}. It stays disabled until you enable it." "$out" \
+      "$(jq -cn --arg id "$id" '{id: $id}')"
+  else
+    reply false "$(last_line "$out")" "$out"
+    return 1
+  fi
+}
+
+cmd_enable() {
+  local id="${1:-}"
+  require_managed "$id"
+  run_stock "" "$id" omarchy-plugin-enable "$id"
+}
+
+cmd_disable() {
+  local id="${1:-}"
+  require_managed "$id"
+  run_stock "" "$id" omarchy-plugin-disable "$id"
+}
+
+# -------------------------------------------------------------------- run
+
+# run --label L --id ID --kind K -- <command...>
+#
+# How the overlay runs anything that ends in a shell rescan. A rescan unloads
+# every panel, the overlay included, and with it any process it was waiting on;
+# so the overlay starts this detached and forgets it. While it works,
+# running.json says what is going on; when it is done the reply lands in
+# last-action.json and the overlay is summoned back to show it.
+cmd_run() {
+  local label="" id="" kind="" seq out
+  while (($# > 0)); do
+    case "$1" in
+    --label) label="${2:-}"; shift 2 ;;
+    --id) id="${2:-}"; shift 2 ;;
+    --kind) kind="${2:-}"; shift 2 ;;
+    --) shift; break ;;
+    *) fail "unknown run option: $1" ;;
+    esac
+  done
+  (($# > 0)) || fail "run needs a command"
+
+  mkdir -p "$CACHE_DIR"
+  exec 7>"$CACHE_DIR/action.lock"
+  flock 7
+
+  seq=$(date +%s%N)
+  jq -cn --arg seq "$seq" --arg label "$label" --arg id "$id" --arg kind "$kind" --arg now "$(date -Iseconds)" \
+    '{seq: $seq, label: $label, id: $id, kind: $kind, startedAt: $now}' >"$CACHE_DIR/running.json.tmp" &&
+    mv "$CACHE_DIR/running.json.tmp" "$CACHE_DIR/running.json"
+
+  out=$("${BASH_SOURCE[0]}" "$@")
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$out" || out=$(reply false "${label:-The action} failed" "$out")
+
+  jq -cn --arg seq "$seq" --arg label "$label" --arg id "$id" --arg kind "$kind" --argjson result "$out" \
+    '{seq: $seq, label: $label, id: $id, kind: $kind, result: $result}' >"$CACHE_DIR/last-action.json.tmp" &&
+    mv "$CACHE_DIR/last-action.json.tmp" "$CACHE_DIR/last-action.json"
+  rm -f "$CACHE_DIR/running.json"
+
+  [[ -n ${PLUGIN_MANAGER_NO_SUMMON:-} ]] || resummon "$(jq -cn --arg seq "$seq" '{resume: $seq}')"
+  printf '%s\n' "$out"
+}
+
+loaded() {
+  [[ $(omarchy-shell shell call "$SELF_ID" ping x 2>/dev/null) == ok ]]
+}
+
+# Bring the manager back with a job's result. When the stock command returns,
+# the rescan it ended with is still going -- panels unload, the registry
+# rescans, and a new plugin folder sets off a second reload 150ms later -- and
+# a summon landing in the middle of that is lost with the old panels. So keep
+# summoning until the overlay answers and is still there a second later.
+# Summoning an overlay that survived only hands it the result again, which it
+# has already shown and ignores.
+resummon() {
+  local payload="$1" i
+  for ((i = 0; i < 20; i++)); do
+    omarchy-shell shell summon "$SELF_ID" "$payload" >/dev/null 2>&1
+    sleep 0.4
+    loaded || continue
+    sleep 0.6
+    loaded && return 0
+  done
+  return 1
+}
+
+# ------------------------------------------------------------------- main
+
+command="${1:-}"
+(($# > 0)) && shift
+
+case "$command" in
+list) cmd_list ;;
+check) cmd_check "$@" ;;
+update) cmd_update "$@" ;;
+remove) cmd_remove "$@" ;;
+add) cmd_add "$@" ;;
+enable) cmd_enable "$@" ;;
+disable) cmd_disable "$@" ;;
+run) cmd_run "$@" ;;
+-h | --help | help)
+  sed -n '3,18p' "$0" | sed 's/^# \?//'
+  ;;
+*) fail "unknown command '${command}'; see --help" ;;
+esac

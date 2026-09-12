@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.kimm-stensborg.plugin-manager",
+  "name": "Plugin Manager",
+  "version": "0.1.0",
+  "author": "Kimm Stensborg",
+  "license": "MIT",
+  "description": "List, inspect, update, add and remove your own Omarchy shell plugins",
+  "kinds": ["overlay", "bar-widget"],
+  "entryPoints": {
+    "overlay": "Manager.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Plugin Manager",
+    "description": "Opens the plugin manager and shows how many plugin updates are waiting",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
