@@ -318,6 +318,60 @@ check "a file that is not an export is refused" '.ok == false and (.message | te
 out=$("$PM" import "$SANDBOX/nowhere.json")
 check "a missing file is refused" '.ok == false and (.message | test("no file"))' "$out"
 
+# --------------------------------------------------------------- opening
+# Shortcuts come from ~/.config/hypr/*.lua, checked against a stand-in hyprctl;
+# menu entries from the user's extension over Omarchy's real defaults, whose
+# "Setup" and "Plugins" labels give the path.
+mkdir -p "$HOME/.config/hypr" "$HOME/.config/omarchy/extensions"
+cat >"$HOME/.config/hypr/bindings.lua" <<'LUA'
+-- o.bind("SUPER + SHIFT + Z", "Old alpha", "omarchy-shell shell toggle test.alpha '{}'")
+o.bind("SUPER + SHIFT + A", "Alpha thing", "omarchy-shell shell toggle test.alpha '{}'")
+o.bind("SUPER + K", "Kappa", "omarchy-shell shell toggle test.kappa '{}'")
+o.bind("SUPER + B", "Browser", "omarchy-launch-browser")
+LUA
+cat >"$HOME/.config/omarchy/extensions/omarchy-menu.jsonc" <<'JSONC'
+{
+  // A comment, and a string that only looks like one: "https://example.invalid"
+  "setup.plugin.kappa": {"icon":"x","label":"Kappa","action":"kappa-open now"},
+}
+JSONC
+cat >"$SANDBOX/bin/hyprctl" <<'STUB'
+#!/bin/bash
+[[ "$*" == "binds -j" ]] &&
+  echo '[{"modmask": 65, "key": "A", "description": "Alpha thing", "dispatcher": "__lua", "arg": "1", "submap": ""}]'
+STUB
+chmod +x "$SANDBOX/bin/hyprctl"
+# test.kappa: a git plugin that ships its own opener script.
+git_plugin "$PLUGINS/test.kappa" test.kappa
+mkdir -p "$PLUGINS/test.kappa/bin"
+printf '#!/bin/bash\n' >"$PLUGINS/test.kappa/bin/kappa-open"
+chmod +x "$PLUGINS/test.kappa/bin/kappa-open"
+commit_all "$PLUGINS/test.kappa" "Add an opener"
+# test.theta: a service, with no window to open.
+write_plugin "$PLUGINS/test.theta" test.theta 1.0.0 '{"kinds": ["service"], "entryPoints": {"service": "Overlay.qml"}}'
+git -C "$PLUGINS/test.theta" init -q -b main
+commit_all "$PLUGINS/test.theta" "Initial"
+
+out=$("$PM" list)
+check "a shortcut in the Hyprland config is found and is live" \
+  '.plugins[] | select(.id == "test.alpha") | .opens.shortcuts | map({keys, description, active}) == [{keys: "SUPER + SHIFT + A", description: "Alpha thing", active: true}]' "$out"
+check "a shortcut says where it is written" \
+  ".plugins[] | select(.id == \"test.alpha\") | .opens.shortcuts[0] | .file == \"$HOME/.config/hypr/bindings.lua\" and .line == 2" "$out"
+check "a shortcut Hyprland does not have is found but not live" \
+  '.plugins[] | select(.id == "test.kappa") | .opens.shortcuts | map({keys, active}) == [{keys: "SUPER + K", active: false}]' "$out"
+check "a menu entry that runs a plugin's own script is found, with its path" \
+  '.plugins[] | select(.id == "test.kappa") | .opens.menu == [{path: "Setup › Plugins › Kappa", action: "kappa-open now"}]' "$out"
+check "a plugin's place in the bar is listed" '.plugins[] | select(.id == "test.alpha") | .opens.bar == [{section: "right"}]' "$out"
+check "a binding for something else belongs to no plugin" \
+  'all(.plugins[]; all(.opens.shortcuts[]; .description != "Browser"))' "$out"
+check "Open runs the plugin's live shortcut" \
+  ".plugins[] | select(.id == \"test.alpha\") | .openCommand == \"omarchy-shell shell toggle test.alpha '{}'\"" "$out"
+check "Open skips a shortcut that is not live and runs the menu entry" \
+  '.plugins[] | select(.id == "test.kappa") | .openCommand == "kappa-open now"' "$out"
+check "Open falls back to a toggle for a plugin nothing opens" \
+  ".plugins[] | select(.id == \"test.broken\") | .openCommand == \"omarchy-shell shell toggle test.broken '{}'\" and .opens == {shortcuts: [], menu: [], bar: []}" "$out"
+check "a service has nothing to open" '.plugins[] | select(.id == "test.theta") | .openCommand == ""' "$out"
+
 # ------------------------------------------------------------------- run
 export PLUGIN_MANAGER_NO_SUMMON=1
 STATE="$XDG_CACHE_HOME/omarchy/plugin-manager"

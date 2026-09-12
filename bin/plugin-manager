@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Plugin Manager backend. The overlay and the bar widget never touch the system
-# themselves: every command here prints exactly one JSON document on stdout.
+# Plugin Manager backend. The overlay never touches the system itself: every
+# command here prints exactly one JSON document on stdout.
 # The actions are thin wrappers over the stock omarchy-plugin-* binaries, so
 # cloning, validation, rollback and shell rescans stay Omarchy's business.
 #
@@ -97,20 +97,19 @@ read_cache() {
 }
 
 # update_cache [jq-args...] <filter> -- applies filter to the cache under a
-# lock, since the overlay and a bar widget per monitor can all write it.
-#
-# The new content is built aside but written over the old file rather than
-# renamed onto it: the bar widget's FileView watches the file, and a rename
-# swaps the inode out from under the watch so the badge never hears of it.
+# lock, since a check, an update and a detached job can all write it at once.
+# The new content is built aside and renamed into place, so a reader never
+# sees half of it.
 update_cache() {
   mkdir -p "$CACHE_DIR"
   (
     flock 9
     tmp=$(mktemp "$CACHE_DIR/.updates.XXXXXX")
     if read_cache | jq "$@" >"$tmp"; then
-      cat "$tmp" >"$CACHE"
+      mv "$tmp" "$CACHE"
+    else
+      rm -f "$tmp"
     fi
-    rm -f "$tmp"
   ) 9>"$CACHE_DIR/cache.lock"
 }
 
@@ -133,17 +132,20 @@ plugin_json() {
   local id="$1"
   local dir="$PLUGINS_DIR/$1"
   local manifest="$dir/manifest.json"
-  local validation valid=true m='{}'
+  local validation valid=true m='{}' bins
 
   validation=$(omarchy-plugin-validate "$dir" 2>&1) || valid=false
   if [[ -f $manifest ]]; then
     m=$(jq -c 'if type == "object" then . else {} end' "$manifest" 2>/dev/null) || m='{}'
     [[ -n $m ]] || m='{}'
   fi
+  # The scripts a plugin ships, which its shortcuts and menu entries may call
+  # instead of naming the plugin's id.
+  bins=$(find "$dir/bin" -maxdepth 1 -type f -perm -u+x -printf '%f\n' 2>/dev/null | jq -R . | jq -cs .)
 
   jq -cn --arg id "$id" --arg dir "$dir" \
     --argjson valid "$valid" --arg validation "${validation#omarchy-plugin-validate: }" \
-    --argjson m "$m" --argjson git "$(git_info "$dir")" '
+    --argjson m "$m" --argjson git "$(git_info "$dir")" --argjson bins "${bins:-[]}" '
     def str(v): if (v | type) == "string" then v else "" end;
     { id: $id,
       manifestId: str($m.id),
@@ -154,13 +156,66 @@ plugin_json() {
       description: str($m.description),
       kinds: (if ($m.kinds | type) == "array" then $m.kinds else [] end),
       path: $dir,
+      bins: $bins,
       valid: $valid,
       validationError: (if $valid then "" else $validation end),
       git: $git }'
 }
 
+# ---------------------------------------------------------------- opening
+
+# How each plugin can be opened: its shortcuts, its Omarchy menu entries and
+# its place in the bar. Hyprland cannot say what a binding runs -- with a Lua
+# config it only holds a function reference -- so shortcuts are read from
+# ~/.config/hypr/*.lua as the plain one-line
+#   o.bind("KEYS", "Description", "command")
+# that Omarchy writes, then matched against Hyprland's live bindings by keys and
+# description to tell which are in effect. A binding built by Lua code instead
+# is not found.
+
+HYPR_DIR="$HOME/.config/hypr"
+MENU_DEFAULTS="${OMARCHY_PATH:-/usr/share/omarchy}/default/omarchy/omarchy-menu.jsonc"
+MENU_USER="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+
+# [{keys, description, command, file, line}] for every o.bind line. A line
+# commented out does not start with o.bind, so it does not count.
+config_binds_json() {
+  local files=("$HYPR_DIR"/*.lua)
+  [[ -e ${files[0]} ]] || {
+    echo '[]'
+    return
+  }
+  grep -Hn 'o\.bind(' "${files[@]}" 2>/dev/null | jq -Rsc '
+    [ split("\n")[]
+      | capture("^(?<file>[^:]+):(?<line>[0-9]+):\\s*o\\.bind\\(\\s*\"(?<keys>[^\"]*)\"\\s*,\\s*\"(?<description>[^\"]*)\"\\s*,\\s*\"(?<command>(\\\\.|[^\"\\\\])*)\"")
+      | .line |= tonumber
+      | .command |= gsub("\\\\(?<c>.)"; .c) ]'
+}
+
+# Hyprland's live bindings, or null when it cannot be asked.
+live_binds_json() {
+  local out
+  if out=$(hyprctl binds -j 2>/dev/null) && jq -e 'type == "array"' >/dev/null 2>&1 <<<"$out"; then
+    jq -c '[.[] | {modmask, key: (.key // ""), description: (.description // "")}]' <<<"$out"
+  else
+    echo null
+  fi
+}
+
+# Every menu entry as {id: entry}, the user's extension merged over the
+# defaults the way the menu merges them. Both files keep one entry per line,
+# which is what lets them be read here without a JSONC parser.
+menu_entries_json() {
+  cat "$MENU_DEFAULTS" "$MENU_USER" 2>/dev/null | jq -Rsc '
+    [ split("\n")[]
+      | capture("^\\s*\"(?<id>[^\"]+)\"\\s*:\\s*(?<entry>\\{.*\\})\\s*,?\\s*$")
+      | .entry |= (try fromjson catch null)
+      | select(.entry | type == "object") ]
+    | reduce .[] as $e ({}; .[$e.id] = ((.[$e.id] // {}) + $e.entry))'
+}
+
 cmd_list() {
-  local shell_plugins cache id
+  local shell_plugins cache config id
   local items=()
 
   # One call for every plugin's enabled bit. Without a running shell there is
@@ -168,15 +223,61 @@ cmd_list() {
   shell_plugins=$(omarchy-shell shell listPlugins 2>/dev/null)
   jq -e 'type == "array"' <<<"$shell_plugins" >/dev/null 2>&1 || shell_plugins='[]'
   cache=$(read_cache)
+  config=$(jq -c 'if type == "object" then . else {} end' "$HOME/.config/omarchy/shell.json" 2>/dev/null)
+  [[ -n $config ]] || config='{}'
 
   while IFS= read -r id; do
     [[ -n $id ]] && items+=("$(plugin_json "$id")")
   done < <(managed_ids)
 
-  printf '%s\n' "${items[@]}" | jq -cs --argjson shell "$shell_plugins" --argjson cache "$cache" '
+  printf '%s\n' "${items[@]}" | jq -cs --argjson shell "$shell_plugins" --argjson cache "$cache" \
+    --argjson binds "$(config_binds_json)" --argjson live "$(live_binds_json)" \
+    --argjson menu "$(menu_entries_json)" --argjson config "$config" --arg braces "'{}'" '
+    def eid: if type == "object" then (.id // "") else tostring end;
+    # "SUPER + SHIFT + L" in the shape hyprctl reports: a modifier mask and a key.
+    def combo:
+      {"SUPER": 64, "MOD": 64, "WIN": 64, "LOGO": 64, "SHIFT": 1, "CTRL": 4, "CONTROL": 4, "ALT": 8, "MOD1": 8} as $mods
+      | [split("+")[] | gsub("^\\s+|\\s+$"; "") | ascii_upcase | select(. != "")] as $parts
+      | { modmask: ([$parts[] | $mods[.] // empty] | add // 0),
+          key: ([$parts[] | select($mods[.] == null)] | last // "") };
+    def esc: gsub("(?<c>[.*+?^$()\\[\\]{}|\\\\])"; "\\\(.c)");
+    # A command belongs to a plugin when it names its id or runs one of its scripts.
+    def mentions($p):
+      . as $cmd
+      | ($cmd | contains($p.id))
+        or any(($p.bins // [])[]; . as $b | $cmd | test("(^|[^A-Za-z0-9._-])" + ($b | esc) + "([^A-Za-z0-9._-]|$)"));
+    # "setup.plugin.manage" as the labels a user clicks through: Setup › Plugins › Manage Plugins.
+    def menupath($id):
+      $id | split(".") as $parts
+      | [range(1; ($parts | length) + 1) | $parts[0:.] | join(".") | ($menu[.].label // .)]
+      | join(" › ");
+
     map(. as $p
         | .enabled = any($shell[]; (.id == $p.id or .id == $p.manifestId) and .enabled == true)
-        | .update = ($cache.plugins[$p.id] // null))
+        | .update = ($cache.plugins[$p.id] // null)
+        | [ $binds[]
+            | select(.command | mentions($p))
+            | . as $b
+            | (.keys | combo) as $c
+            | . + {active: (if $live == null then null
+                            else any($live[]; .modmask == $c.modmask and (.key | ascii_upcase) == $c.key
+                                              and .description == $b.description) end)} ] as $shortcuts
+        | [ $menu | to_entries[]
+            | select((.value.action | type) == "string" and (.value.action | mentions($p)))
+            | {path: menupath(.key), action: .value.action} ] as $entries
+        | [ ("left", "center", "right") as $section
+            | (($config.bar.layout // {})[$section] // [])[]
+            | select(eid == $p.id)
+            | {section: $section} ] as $bar
+        | .opens = {shortcuts: $shortcuts, menu: $entries, bar: $bar}
+        # What Open runs: what its own shortcut or menu entry runs, else a toggle
+        # for anything with a window to show, else nothing.
+        | .openCommand = (
+            ([$shortcuts[] | select(.active != false) | .command] + [$entries[].action]) as $commands
+            | if ($commands | length) > 0 then $commands[0]
+              elif any(.kinds[]; . == "overlay" or . == "panel" or . == "menu")
+              then "omarchy-shell shell toggle \($p.id) \($braces)"
+              else "" end))
     | sort_by(.name | ascii_downcase)
     | {ok: true, checkedAt: ($cache.checkedAt // null), plugins: .}'
 }
@@ -234,8 +335,9 @@ cmd_check() {
   done
   [[ -z $only ]] || require_managed "$only"
 
-  # One check at a time. A bar widget on every monitor fires its timer at
-  # once; the second one waits here and then finds the cache fresh.
+  # One check at a time. The check opening the manager starts and one asked
+  # for by hand can overlap; the second waits here and then finds the cache
+  # fresh.
   mkdir -p "$CACHE_DIR"
   exec 8>"$CACHE_DIR/check.lock"
   flock 8

@@ -1,12 +1,13 @@
 # Plugin Manager
 
 One place to look after the Omarchy shell plugins you installed from git:
-list them, read their details, see which have updates waiting, update, enable,
-disable, remove, add new ones from a git URL, and carry the whole set to
-another Omarchy install with an export file.
+list them, read their details, see how each one is opened and open it, see
+which have updates waiting, update, enable, disable, remove, add new ones from
+a git URL, and carry the whole set to another Omarchy install with an export
+file.
 
 - **Plugin ID:** `io.github.kimm-stensborg.plugin-manager`
-- **Kinds:** `overlay`, `bar-widget`
+- **Kind:** `overlay`
 - **License:** MIT
 - **Requires:** Omarchy 4 (Quattro) with `omarchy-shell`; `git`, `jq`
 
@@ -26,7 +27,7 @@ omarchy plugin add https://github.com/kimm-stensborg/omarchy-plugin-manager.git
 ~/.config/omarchy/plugins/io.github.kimm-stensborg.plugin-manager/install.sh
 ```
 
-`install.sh` gives you three ways in:
+`install.sh` enables the plugin and gives you two ways to open it:
 
 - a **shortcut**. It proposes the first free one of `SUPER + ALT + P`,
   `SUPER + CTRL + SHIFT + P`, `SUPER + SHIFT + U` and `SUPER + ALT + U`, and
@@ -34,12 +35,10 @@ omarchy plugin add https://github.com/kimm-stensborg/omarchy-plugin-manager.git
   `~/.config/hypr/bindings.lua`.
 - a **menu entry**, *Setup › Plugins › Manage Plugins*, in
   `~/.config/omarchy/extensions/omarchy-menu.jsonc`.
-- the **bar button**. Enabling the plugin puts it in the right section. It
-  shows a badge with the number of plugins that have an update.
 
 ```bash
 install.sh --key "SUPER + ALT + P"   # skip the prompt
-install.sh --no-bind                 # menu entry and bar button only
+install.sh --no-bind                 # menu entry only
 install.sh --uninstall               # take the shortcut and menu entry out
 ```
 
@@ -54,6 +53,7 @@ omarchy-shell shell toggle io.github.kimm-stensborg.plugin-manager '{}'
 | Key | Does |
 |-----|------|
 | `↑` `↓` / `j` `k`, `Home` `End` | select a plugin |
+| `⏎` | open the selected plugin |
 | `c` | check the selected plugin for an update |
 | `C` | check every plugin |
 | `u` | update the selected plugin |
@@ -72,10 +72,35 @@ For every plugin:
 - name, version, description, author, license and kinds
 - whether it is enabled
 - its remote, branch, commit and last commit
+- **how it opens**: its shortcuts, its entries in the Omarchy menu, and its
+  place in the bar
 
 Problems are called out: a manifest the validator rejects, local changes that
 would stop an update from fast-forwarding, and a checkout that has diverged
 from upstream.
+
+## Opening a plugin
+
+A shortcut or menu entry belongs to a plugin when its command names the
+plugin's id, or runs a script from the plugin's own `bin/` folder.
+
+- **Shortcuts** are read from the `o.bind("KEYS", "Description", "command")`
+  lines in `~/.config/hypr/*.lua`. Hyprland cannot say what a binding runs
+  with a Lua config, so each one is checked against Hyprland's live bindings
+  by keys and description. A shortcut that has been unbound or taken over is
+  marked as not active.
+- **Menu entries** come from the Omarchy menu: the defaults, with your
+  `omarchy-menu.jsonc` on top. Each is shown as its path, for example
+  *Setup › Plugins › Manage Plugins*.
+
+Two kinds of shortcut are not found: one that runs a script of your own which
+then opens the plugin, and one built by Lua code instead of written as a plain
+`o.bind` line.
+
+`⏎`, or the **Open** button, closes the manager and opens the plugin with the
+command its own shortcut or menu entry runs. When it has neither, Open uses a
+plain `omarchy-shell shell toggle <id> '{}'`. A plugin that only runs in the
+background has nothing to open, and a disabled one has to be enabled first.
 
 ## Updates
 
@@ -83,10 +108,9 @@ A check does the same fetch as `omarchy plugin update`, so "3 new commits"
 means exactly what an update would bring in. The commits are listed, along
 with the version the upstream manifest declares.
 
-The results are cached in `~/.cache/omarchy/plugin-manager/updates.json`. The
-bar button checks at startup and every six hours after that, and opening the
-manager redoes a check older than that. A lock keeps the bar on each monitor
-from fetching at the same time.
+The results are cached in `~/.cache/omarchy/plugin-manager/updates.json`.
+Opening the manager redoes a check that is more than six hours old, and `C`
+checks again at any time.
 
 ## Adding
 
@@ -130,7 +154,6 @@ bin/plugin-manager import <file>
 | Path | What |
 |------|------|
 | `Manager.qml` | the overlay: list, details, actions |
-| `BarWidget.qml` | the bar button and its update badge |
 | `bin/plugin-manager` | the backend; the only code that touches the system |
 | `install.sh` | shortcut, menu entry, enable |
 | `test.sh` | backend tests |
@@ -148,6 +171,9 @@ panel, this one included. So the overlay does not wait on them. It starts
 2. writes the reply to `last-action.json`,
 3. summons the manager back, which shows the result.
 
+The manager is gone for a second or two while the shell rebuilds its panels;
+no plugin can stay on screen through that.
+
 Checks, exports and import previews do not rescan, so they run directly.
 
 ## Remove
@@ -160,17 +186,20 @@ rm -rf ~/.cache/omarchy/plugin-manager
 
 ## Developing
 
-Symlink a working copy in place of the installed plugin:
+Work in a clone of the repository and bring commits into the installed copy
+without going through GitHub:
 
 ```bash
-ln -sfn ~/Projects/omarchy-plugin-manager ~/.config/omarchy/plugins/io.github.kimm-stensborg.plugin-manager
-omarchy-shell shell rescanPlugins
+git -C ~/.config/omarchy/plugins/io.github.kimm-stensborg.plugin-manager pull ~/Projects/omarchy-plugin-manager main
+omarchy restart shell
 ```
 
+Do not edit the installed copy itself: `omarchy plugin update` refuses to
+fast-forward over local changes.
+
 A rescan does not pick up changed QML: the shell keeps the compiled component
-cached for as long as the old instance is alive. After changing
-`Manager.qml` or `BarWidget.qml`, run `omarchy restart shell`. The backend is
-re-read on every call, so changes there need nothing. Errors land in
+cached for as long as the old instance is alive, so after changing
+`Manager.qml` run `omarchy restart shell`. Errors land in
 `/run/user/$UID/quickshell/by-id/*/log.log`. To drive the overlay without
 touching the keyboard, `omarchy-shell shell call <id> <function> x` calls any
 of its functions, for example `toggleEnabled` or `checkAll`.

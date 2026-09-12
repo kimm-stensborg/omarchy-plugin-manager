@@ -435,6 +435,23 @@ Item {
     root.dismiss()
   }
 
+  // Close the manager and open the selected plugin the way its own shortcut or
+  // menu entry would; the backend picks that command, or a plain toggle.
+  function openPlugin() {
+    var p = root.current
+    if (!p) return
+    if (!p.openCommand) {
+      root.setStatus(p.name + " has no window to open; it runs in the background", false)
+      return
+    }
+    if (!p.enabled) {
+      root.setStatus(p.name + " is disabled; enable it first  (e)", true)
+      return
+    }
+    root.dismiss()
+    Quickshell.execDetached(["sh", "-c", p.openCommand])
+  }
+
   // ------------------------------------------------------------- helpers
 
   function parseJson(text) {
@@ -525,6 +542,17 @@ Item {
     add("License", p.license)
     add("Kinds", (p.kinds || []).join(", "))
     add("Status", p.enabled ? "enabled" : "disabled")
+    // How it opens: its shortcuts, menu entries and place in the bar. With
+    // none of those, the command the Open button runs.
+    var opens = p.opens || { shortcuts: [], menu: [], bar: [] }
+    for (var i = 0; i < opens.shortcuts.length; i++) {
+      var s = opens.shortcuts[i]
+      add("Shortcut", s.keys + (s.description ? "  ·  " + s.description : "")
+                      + (s.active === false ? "  (not active)" : ""))
+    }
+    for (var j = 0; j < opens.menu.length; j++) add("Menu", opens.menu[j].path)
+    for (var k = 0; k < opens.bar.length; k++) add("Bar", opens.bar[k].section + " section")
+    if (opens.shortcuts.length + opens.menu.length + opens.bar.length === 0) add("Opens with", p.openCommand)
     if (p.git) {
       add("Remote", p.git.remote)
       add("Branch", p.git.branch + (p.git.commit ? " @ " + p.git.commit : ""))
@@ -547,6 +575,7 @@ Item {
     else if (key === Qt.Key_Down || t === "j") root.move(1)
     else if (key === Qt.Key_Home) root.select(0)
     else if (key === Qt.Key_End) root.select(root.plugins.length - 1)
+    else if (key === Qt.Key_Return || key === Qt.Key_Enter) root.openPlugin()
     else if (t === "c") root.checkCurrent()
     else if (t === "C") root.checkAll()
     else if (t === "u") root.updateCurrent()
@@ -1070,6 +1099,16 @@ Item {
             Button {
               visible: root.current !== null
               bordered: true
+              foreground: root.current && root.current.openCommand && root.current.enabled ? root.foreground : root.muted
+              fontFamily: root.fontFamily
+              text: "Open"
+              tooltipText: "Close the manager and open this plugin  (⏎)"
+              onClicked: root.openPlugin()
+            }
+
+            Button {
+              visible: root.current !== null
+              bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
               text: "Check"
@@ -1143,7 +1182,7 @@ Item {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
-            text: "↑↓ select   c check   u update   e enable   d remove   a add/import   x export   o repo   esc close"
+            text: "↑↓ select   ⏎ open   c check   u update   e enable   d remove   a add/import   x export   o repo   esc close"
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
