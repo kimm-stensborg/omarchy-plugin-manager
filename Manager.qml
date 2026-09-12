@@ -1581,66 +1581,78 @@ Item {
                 id: openersRepeater
                 model: root.openers(root.current)
 
-                Item {
+                // Each one closed off by a divider of its own.
+                Column {
                   id: openerRow
                   required property var modelData
                   width: detailsColumn.width
-                  height: Math.max(openerText.implicitHeight, openerButtons.implicitHeight)
+                  spacing: detailsColumn.spacing
 
-                  Column {
-                    id: openerText
-                    anchors.left: parent.left
-                    anchors.right: openerButtons.left
-                    anchors.rightMargin: Style.spacing.lg
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: Style.spacing.xxs
+                  Item {
+                    width: parent.width
+                    height: Math.max(openerText.implicitHeight, openerButtons.implicitHeight)
 
-                    Text {
-                      textFormat: Text.PlainText
-                      text: openerRow.modelData.title
-                      color: root.muted
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                    }
-
-                    Repeater {
-                      model: openerRow.modelData.lines
+                    Column {
+                      id: openerText
+                      anchors.left: parent.left
+                      anchors.right: openerButtons.left
+                      anchors.rightMargin: Style.spacing.lg
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.spacing.xxs
 
                       Text {
-                        required property string modelData
-                        width: openerText.width
-                        wrapMode: Text.WrapAnywhere
                         textFormat: Text.PlainText
-                        text: modelData
-                        color: modelData === "none" ? root.muted : root.foreground
+                        text: openerRow.modelData.title
+                        color: root.muted
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      Repeater {
+                        model: openerRow.modelData.lines
+
+                        Text {
+                          required property string modelData
+                          width: openerText.width
+                          wrapMode: Text.WrapAnywhere
+                          textFormat: Text.PlainText
+                          text: modelData
+                          color: modelData === "none" ? root.muted : root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                        }
+                      }
+                    }
+
+                    Row {
+                      id: openerButtons
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.spacing.controlGap
+
+                      Repeater {
+                        model: openerRow.modelData.actions
+
+                        Button {
+                          required property var modelData
+                          bordered: true
+                          foreground: root.foreground
+                          fontFamily: root.fontFamily
+                          fontSize: Style.font.caption
+                          horizontalPadding: Style.spacing.md
+                          verticalPadding: Style.spacing.xxs
+                          text: modelData.text
+                          tooltipText: modelData.tip
+                          onClicked: root.openerAction(modelData.kind)
+                        }
                       }
                     }
                   }
 
-                  Row {
-                    id: openerButtons
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: Style.spacing.controlGap
-
-                    Repeater {
-                      model: openerRow.modelData.actions
-
-                      Button {
-                        required property var modelData
-                        bordered: true
-                        foreground: root.foreground
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        horizontalPadding: Style.spacing.md
-                        verticalPadding: Style.spacing.xxs
-                        text: modelData.text
-                        tooltipText: modelData.tip
-                        onClicked: root.openerAction(modelData.kind)
-                      }
-                    }
+                  Rectangle {
+                    width: parent.width
+                    height: 1
+                    color: root.faint
                   }
                 }
               }
