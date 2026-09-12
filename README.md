@@ -161,7 +161,9 @@ plugin's id, or runs a script from the plugin's own `bin/` folder.
   lines in `~/.config/hypr/*.lua`. Hyprland cannot say what a binding runs
   with a Lua config, so each one is checked against Hyprland's live bindings
   by keys and description. A shortcut that has been unbound or taken over is
-  marked as not active.
+  marked as not active. Each is tagged with who wrote it: *by the plugin*
+  under the comment a plugin's `install.sh` writes, `-- Name (<id>)`;
+  *by Plugin Manager* for one set here; *custom* for any other.
 - **Menu entries** come from the Omarchy menu: the defaults, with your
   `omarchy-menu.jsonc` on top. Each is shown as its path, for example
   *Setup › Plugins › Manage Plugins*.
@@ -230,8 +232,9 @@ manager keeps to:
 - **It only touches entries it looks after.** It can move an entry it wrote,
   or take it out (**Remove entry**). The same goes for an entry a plugin wrote
   for itself under the comment `install.sh` uses, `// ── Name (<id>)`, which is
-  how Default Applications adds its own; the list marks those
-  *(added by the plugin)*. It never edits an entry anyone else wrote.
+  how Default Applications adds its own; those are tagged *by the plugin*,
+  the ones it wrote *by Plugin Manager*. It never edits an entry anyone else
+  wrote.
 
 ## Export and import
 

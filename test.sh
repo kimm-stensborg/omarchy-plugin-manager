@@ -376,6 +376,7 @@ BINDINGS="$HOME/.config/hypr/bindings.lua"
 cat >"$BINDINGS" <<'LUA'
 -- o.bind("SUPER + SHIFT + Z", "Old alpha", "omarchy-shell shell toggle test.alpha '{}'")
 o.bind("SUPER + SHIFT + A", "Alpha thing", "omarchy-shell shell toggle test.alpha '{}'")
+-- Kappa overlay (test.kappa)
 o.bind("SUPER + K", "Kappa", "omarchy-shell shell toggle test.kappa '{}'")
 o.bind("SUPER + B", "Browser", "omarchy-launch-browser")
 LUA
@@ -406,6 +407,10 @@ check "a shortcut Hyprland does not have is found but not live" \
   '.plugins[] | select(.id == "test.kappa") | .opens.shortcuts | map({keys, active}) == [{keys: "SUPER + K", active: false}]' "$out"
 check "a shortcut written by hand is not the manager's" \
   '.plugins[] | select(.id == "test.alpha") | .opens.shortcuts[0].managed == false' "$out"
+check "nor anyone's in particular, a commented-out binding above it notwithstanding" \
+  '.plugins[] | select(.id == "test.alpha") | .opens.shortcuts[0].addedBy == null' "$out"
+check "a shortcut under the comment a plugin's install.sh writes is the plugin's, not the manager's" \
+  '.plugins[] | select(.id == "test.kappa") | .opens.shortcuts | map({keys, addedBy, managed}) == [{keys: "SUPER + K", addedBy: "plugin", managed: false}]' "$out"
 check "a menu entry that runs a plugin's own script is found, with its path" \
   '.plugins[] | select(.id == "test.kappa") | .opens.menu | map({path, action}) == [{path: "Setup › Plugins › Kappa", action: "kappa-open now"}]' "$out"
 check "a plugin's place in the bar is listed" '.plugins[] | select(.id == "test.alpha") | .opens.bar == [{section: "right"}]' "$out"
@@ -510,7 +515,7 @@ holds "the binding is written below its comment" \
 holds "Hyprland is reloaded" 'grep -qx reload "$HYPR_LOG" && grep -qx configerrors "$HYPR_LOG"'
 holds "the bindings written by hand are left alone" 'grep -qF "\"Alpha thing\"" "$BINDINGS" && grep -qF "\"Browser\"" "$BINDINGS"'
 check "the list knows the manager made it" \
-  '.plugins[] | select(.id == "test.kappa") | any(.opens.shortcuts[]; .keys == "SUPER + ALT + K" and .managed)' "$("$PM" list)"
+  '.plugins[] | select(.id == "test.kappa") | any(.opens.shortcuts[]; .keys == "SUPER + ALT + K" and .managed and .addedBy == "manager")' "$("$PM" list)"
 out=$("$PM" keycheck "SUPER + ALT + K" test.kappa)
 check "a plugin's own shortcut is no conflict for itself" '.taken == false' "$out"
 
@@ -538,6 +543,7 @@ out=$("$PM" unbind test.kappa)
 check "unbind succeeds" '.ok == true' "$out"
 holds "unbind takes the whole block out" '! grep -qF "(test.kappa), bound by Plugin Manager" "$BINDINGS" && ! grep -qF "hl.unbind" "$BINDINGS"'
 holds "and nothing else" 'grep -qF "\"Alpha thing\"" "$BINDINGS" && grep -qF "\"Kappa\"" "$BINDINGS"'
+holds "not even the plugin's own comment" 'grep -qxF -- "-- Kappa overlay (test.kappa)" "$BINDINGS"'
 out=$("$PM" unbind test.kappa)
 check "unbinding what the manager did not make is refused" '.ok == false' "$out"
 out=$("$PM" unbind test.alpha)

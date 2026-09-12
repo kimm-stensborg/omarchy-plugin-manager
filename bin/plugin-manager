@@ -255,16 +255,22 @@ config_binds_json() {
       | .command |= gsub("\\\\(?<c>.)"; .c) ]'
 }
 
-# [{file, line, id}] for the comment line above every binding the manager made.
+# [{file, line, id, by}] for the comment line above a binding that names the
+# plugin it is for. `by` is "manager" for one the manager made, and "plugin"
+# for one a plugin's install.sh wrote for itself under
+#   -- Name (<id>)
+# which only tells who wrote it: the manager moves and removes its own alone.
 bind_markers_json() {
   local files=("$HYPR_DIR"/*.lua)
   [[ -e ${files[0]} ]] || {
     echo '[]'
     return
   }
-  grep -Hn -e "^-- .*, $BIND_MARK\$" "${files[@]}" 2>/dev/null | jq -Rsc --arg mark "$BIND_MARK" '
+  grep -Hn -e "^-- .*, $BIND_MARK\$" -e '^-- .*([A-Za-z0-9._-]*)$' "${files[@]}" 2>/dev/null |
+    jq -Rsc --arg mark "$BIND_MARK" '
     [ split("\n")[]
-      | capture("^(?<file>[^:]+):(?<line>[0-9]+):-- .*\\((?<id>[^()]+)\\), " + $mark + "$")
+      | (capture("^(?<file>[^:]+):(?<line>[0-9]+):-- .*\\((?<id>[^()]+)\\), " + $mark + "$") | .by = "manager")
+        // (capture("^(?<file>[^:]+):(?<line>[0-9]+):-- .*\\((?<id>[A-Za-z0-9._-]+)\\)$") | .by = "plugin")
       | .line |= tonumber ]'
 }
 
@@ -380,12 +386,14 @@ cmd_list() {
             | select(.command | mentions($p))
             | . as $b
             | (.keys | combo) as $c
+            # Who wrote it, going by the comment just above: "manager" or "plugin".
+            | (first($markers[] | select(.id == $p.id and .file == $b.file
+                                         and ($b.line - .line) >= 1 and ($b.line - .line) <= 2) | .by) // null) as $by
             | . + {active: (if $live == null then null
                             else any($live[]; .modmask == $c.modmask and (.key | ascii_upcase) == $c.key
                                               and .description == $b.description) end),
-                   # The manager made it when its comment sits just above.
-                   managed: any($markers[]; .id == $p.id and .file == $b.file
-                                            and ($b.line - .line) >= 1 and ($b.line - .line) <= 2)} ] as $shortcuts
+                   managed: ($by == "manager"),
+                   addedBy: $by} ] as $shortcuts
         | [ $menu | to_entries[]
             | select((.value.action | type) == "string" and (.value.action | mentions($p)))
             | .key as $k
@@ -736,7 +744,7 @@ cmd_disable() {
 # The keys of the binding the manager made for a plugin, if it made one.
 own_bind_keys() {
   jq -rn --argjson binds "$(config_binds_json)" --argjson markers "$(bind_markers_json)" --arg id "$1" "$JQ_KEYS"'
-    [ $markers[] | select(.id == $id) as $m
+    [ $markers[] | select(.id == $id and .by == "manager") as $m
       | $binds[] | select(.file == $m.file and (.line - $m.line) >= 1 and (.line - $m.line) <= 2)
       | .keys | combo | keylabel ] | .[0] // ""'
 }
