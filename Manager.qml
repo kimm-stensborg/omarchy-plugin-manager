@@ -1689,7 +1689,7 @@ Item {
 
             Text {
               width: parent.width
-              wrapMode: Text.WrapAnywhere
+              elide: Text.ElideMiddle
               textFormat: Text.PlainText
               text: root.current ? "Runs: " + root.current.openCommand : ""
               color: root.muted
