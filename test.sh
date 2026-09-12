@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Backend tests. Everything runs against a throwaway $HOME holding fake plugins
-# and local bare "upstreams", with a stand-in omarchy-shell first on PATH, so no
-# real plugin is fetched, updated or removed and the running shell is never
-# asked anything.
+# and local bare "upstreams", with stand-ins for omarchy-shell, hyprctl and
+# omarchy-notification-send first on PATH, so no real plugin is fetched,
+# updated or removed, and neither the running shell nor Hyprland is touched.
 #
 #   ./test.sh
 
@@ -25,12 +25,18 @@ export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid
 PLUGINS="$HOME/.config/omarchy/plugins"
 mkdir -p "$PLUGINS"
 
-# A stand-in for omarchy-shell, first on PATH, so no test talks to the running
-# shell. It answers listPlugins from the sandbox's own plugins, remembers what
-# was enabled in $SHELL_ENABLED, and logs every call to $SHELL_LOG.
+# Stand-ins, first on PATH:
+# - omarchy-shell answers listPlugins from the sandbox's own plugins, remembers
+#   what was enabled in $SHELL_ENABLED, and logs every call to $SHELL_LOG;
+# - hyprctl reports the bindings in $HYPR_BINDS and the errors in $HYPR_ERRORS,
+#   and logs every call to $HYPR_LOG;
+# - omarchy-notification-send logs every notification to $NOTIFY_LOG.
 mkdir -p "$SANDBOX/bin"
 export SHELL_LOG="$SANDBOX/shell.log" SHELL_ENABLED="$SANDBOX/enabled"
-touch "$SHELL_LOG" "$SHELL_ENABLED"
+export HYPR_LOG="$SANDBOX/hyprctl.log" HYPR_BINDS="$SANDBOX/binds.json" HYPR_ERRORS="$SANDBOX/configerrors"
+export NOTIFY_LOG="$SANDBOX/notify.log"
+touch "$SHELL_LOG" "$SHELL_ENABLED" "$HYPR_LOG" "$HYPR_ERRORS" "$NOTIFY_LOG"
+echo '[]' >"$HYPR_BINDS"
 cat >"$SANDBOX/bin/omarchy-shell" <<'SHIM'
 #!/bin/bash
 [[ ${1:-} == -q ]] && shift
@@ -57,7 +63,20 @@ call) echo unknown ;;
 *) echo ok ;;
 esac
 SHIM
-chmod +x "$SANDBOX/bin/omarchy-shell"
+cat >"$SANDBOX/bin/hyprctl" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$*" >>"$HYPR_LOG"
+case "$*" in
+"binds -j") cat "$HYPR_BINDS" ;;
+reload) echo ok ;;
+configerrors) cat "$HYPR_ERRORS" ;;
+esac
+SHIM
+cat >"$SANDBOX/bin/omarchy-notification-send" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$*" >>"$NOTIFY_LOG"
+SHIM
+chmod +x "$SANDBOX/bin/omarchy-shell" "$SANDBOX/bin/hyprctl" "$SANDBOX/bin/omarchy-notification-send"
 export PATH="$SANDBOX/bin:$PATH"
 
 passed=0
@@ -71,6 +90,17 @@ check() { # description, jq expression, json
     echo "FAIL: $1"
     echo "      expected: $2"
     echo "      got:      $(head -c 600 <<<"$3")"
+  fi
+}
+
+# holds <description> <shell condition> -- for what is checked on disk.
+holds() {
+  if eval "$2"; then
+    passed=$((passed + 1))
+  else
+    failed=$((failed + 1))
+    echo "FAIL: $1"
+    echo "      expected to hold: $2"
   fi
 }
 
@@ -122,8 +152,8 @@ write_plugin "$PLUGINS/test.beta" test.beta 0.1.0
 write_plugin "$PLUGINS/test.gamma" test.gamma 1.0.0 '{"omarchy": {"clonedFrom": "omarchy.clock"}}'
 git_plugin "$SANDBOX/link-work" test.link
 ln -s "$SANDBOX/link-work" "$PLUGINS/test.link"
-# The manager itself, a git plugin like the rest, which must never show up or
-# be acted on.
+# The manager itself, a git plugin like the rest: listed and checked, but never
+# removed or switched off.
 git_plugin "$PLUGINS/$SELF_ID" "$SELF_ID"
 # A remove backup, which is not a plugin.
 write_plugin "$PLUGINS/.test.old.bak.20260101000000" test.old 1.0.0
@@ -131,8 +161,10 @@ write_plugin "$PLUGINS/.test.old.bak.20260101000000" test.old 1.0.0
 # ------------------------------------------------------------------ list
 out=$("$PM" list)
 check "list succeeds" '.ok == true' "$out"
-check "list shows the git plugins, sorted" '[.plugins[].id] == ["test.alpha", "test.broken"]' "$out"
-check "list never shows the manager itself" "all(.plugins[]; .id != \"$SELF_ID\")" "$out"
+check "list shows the git plugins, sorted, the manager among them" \
+  "[.plugins[].id] == [\"$SELF_ID\", \"test.alpha\", \"test.broken\"]" "$out"
+check "the manager is marked as itself, and nothing else is" \
+  "all(.plugins[]; .self == (.id == \"$SELF_ID\"))" "$out"
 check "a git plugin carries its remote, branch and last commit" \
   ".plugins[] | select(.id == \"test.alpha\") | .git.remote == \"$SANDBOX/alpha.git\" and .git.branch == \"main\" and .git.subject == \"Initial\" and .git.dirty == false" "$out"
 check "manifest fields come through" \
@@ -152,7 +184,7 @@ check "check lists the incoming commits, newest first" \
 check "a git plugin without a remote says why it cannot be checked" '.plugins["test.broken"].error | length > 0' "$out"
 check "check leaves out plugins that are not git" \
   '.plugins | (has("test.beta") or has("test.gamma") or has("test.link")) | not' "$out"
-check "check skips the manager itself" ".plugins | has(\"$SELF_ID\") | not" "$out"
+check "check covers the manager too" ".plugins | has(\"$SELF_ID\")" "$out"
 out=$("$PM" list)
 check "list carries the cached update status" \
   '.plugins[] | select(.id == "test.alpha") | .update.behind == 2' "$out"
@@ -161,13 +193,27 @@ out=$("$PM" check --if-stale 3600)
 check "a fresh cache is returned without fetching" '.plugins["test.alpha"].behind == 2' "$out"
 
 out=$("$PM" check "$SELF_ID")
-check "checking the manager itself is refused" '.ok == false' "$out"
+check "the manager can check itself" ".ok == true and (.plugins | has(\"$SELF_ID\"))" "$out"
 out=$("$PM" check test.beta)
 check "checking a plugin that is not git is refused" '.ok == false and (.message | test("not a git plugin"))' "$out"
+
+# ---------------------------------------------------------- notification
+: >"$NOTIFY_LOG"
+"$PM" check --notify >/dev/null
+holds "a check with --notify announces a new update" 'grep -qF "test.alpha name has an update" "$NOTIFY_LOG"'
+holds "the notification opens the manager when clicked" \
+  'grep -qF -- "--exec omarchy-shell shell summon $SELF_ID {}" "$NOTIFY_LOG"'
+: >"$NOTIFY_LOG"
+"$PM" check --notify >/dev/null
+holds "the same update is not announced twice" '[[ ! -s $NOTIFY_LOG ]]'
+"$PM" check >/dev/null
+holds "a check without --notify announces nothing" '[[ ! -s $NOTIFY_LOG ]]'
 
 # ---------------------------------------------------------------- update
 out=$("$PM" update test.gamma)
 check "updating a plugin that is not git is refused" '.ok == false and (.message | test("not a git plugin"))' "$out"
+out=$("$PM" update "$SELF_ID")
+check "the manager may update itself" '.message | test("itself") | not' "$out"
 out=$("$PM" update test.alpha)
 check "update succeeds" '.ok == true and .id == "test.alpha"' "$out"
 out=$("$PM" list)
@@ -183,13 +229,17 @@ git -C "$PLUGINS/test.alpha" checkout -q -- Overlay.qml
 : >"$SHELL_LOG"
 out=$("$PM" enable test.alpha)
 check "enable goes through the shell" '.ok == true' "$out"
-check "enable asks the shell to enable it" 'true' "$(grep -qxF 'enablePlugin test.alpha {}' "$SHELL_LOG" && echo '{}')"
+holds "enable asks the shell to enable it" 'grep -qxF "enablePlugin test.alpha {}" "$SHELL_LOG"'
 check "an enabled plugin lists as enabled" '.plugins[] | select(.id == "test.alpha") | .enabled == true' "$("$PM" list)"
 out=$("$PM" disable test.alpha)
-check "disable asks the shell to disable it" 'true' \
-  "$([[ $(jq -r .ok <<<"$out") == true ]] && grep -qxF 'setPluginEnabled test.alpha false' "$SHELL_LOG" && echo '{}')"
+check "disable succeeds" '.ok == true' "$out"
+holds "disable asks the shell to disable it" 'grep -qxF "setPluginEnabled test.alpha false" "$SHELL_LOG"'
 out=$("$PM" enable test.beta)
 check "enabling a plugin that is not git is refused" '.ok == false and (.message | test("not a git plugin"))' "$out"
+out=$("$PM" disable "$SELF_ID")
+check "the manager does not switch itself off" '.ok == false and (.message | test("itself"))' "$out"
+out=$("$PM" enable "$SELF_ID")
+check "nor on" '.ok == false and (.message | test("itself"))' "$out"
 
 # ------------------------------------------------------------------- add
 git init -q --bare -b main "$SANDBOX/delta.git"
@@ -199,7 +249,7 @@ commit_all "$SANDBOX/delta-work" "Initial"
 git -C "$SANDBOX/delta-work" push -q "$SANDBOX/delta.git" main
 out=$("$PM" add "$SANDBOX/delta.git")
 check "add clones the plugin and reports its id" '.ok == true and .id == "test.delta"' "$out"
-check "the added plugin is on disk" 'true' "$(test -f "$PLUGINS/test.delta/manifest.json" && echo '{}')"
+holds "the added plugin is on disk" '[[ -f $PLUGINS/test.delta/manifest.json ]]'
 check "the added plugin is a git plugin in the list" '[.plugins[].id] | index("test.delta") != null' "$("$PM" list)"
 out=$("$PM" add "$SANDBOX/delta.git")
 check "adding the same plugin twice is refused" '.ok == false and (.message | test("already"))' "$out"
@@ -209,16 +259,16 @@ check "add needs a URL" '.ok == false' "$out"
 # ---------------------------------------------------------------- remove
 out=$("$PM" remove test.delta)
 check "remove succeeds" '.ok == true' "$out"
-check "the removed git plugin is gone" 'true' "$([[ ! -e $PLUGINS/test.delta ]] && echo '{}')"
+holds "the removed git plugin is gone" '[[ ! -e $PLUGINS/test.delta ]]'
 out=$("$PM" remove test.beta)
 check "removing a plugin that is not git is refused" '.ok == false and (.message | test("not a git plugin"))' "$out"
-check "it is still on disk" 'true' "$([[ -d $PLUGINS/test.beta ]] && echo '{}')"
+holds "it is still on disk" '[[ -d $PLUGINS/test.beta ]]'
 out=$("$PM" remove test.link)
 check "a symlink to a git working copy is not a git plugin" '.ok == false and (.message | test("not a git plugin"))' "$out"
-check "the symlink is still there" 'true' "$([[ -L $PLUGINS/test.link ]] && echo '{}')"
+holds "the symlink is still there" '[[ -L $PLUGINS/test.link ]]'
 out=$("$PM" remove "$SELF_ID")
 check "removing the manager itself is refused" '.ok == false and (.message | test("itself"))' "$out"
-check "the manager is still there" 'true' "$([[ -d $PLUGINS/$SELF_ID ]] && echo '{}')"
+holds "the manager is still there" '[[ -d $PLUGINS/$SELF_ID ]]'
 out=$("$PM" remove ../../etc)
 check "a path is not an id" '.ok == false and (.message | test("invalid"))' "$out"
 out=$("$PM" remove test.nope)
@@ -262,7 +312,7 @@ check "a checkout whose remote is a local path is skipped" \
 out=$("$PM" export)
 check "export without a path writes to the home folder" \
   "(.path | startswith(\"$HOME/omarchy-plugins-\")) and (.path | endswith(\".json\"))" "$out"
-check "the default export file exists" 'true' "$([[ -f $(jq -r .path <<<"$out") ]] && echo '{}')"
+holds "the default export file exists" '[[ -f $(jq -r .path <<<"$out") ]]'
 
 # ---------------------------------------------------------------- import
 # epsilon: a bar widget placed before omarchy.menu with a label; zeta: an
@@ -294,18 +344,17 @@ check "a dry run refuses an id that is a path" '.plan[] | select(.id == "../evil
 check "a dry run says where an enabled widget goes" \
   '.plan[] | select(.id == "test.epsilon") | .action == "install" and .where == "in the left section"' "$out"
 check "a dry run passes on what the export skipped" '.skippedAtExport[0].id == "test.lib"' "$out"
-check "a dry run clones nothing" 'true' "$([[ ! -e $PLUGINS/test.epsilon ]] && echo '{}')"
+holds "a dry run clones nothing" '[[ ! -e $PLUGINS/test.epsilon ]]'
 
 : >"$SHELL_LOG"
 out=$("$PM" import "$SANDBOX/import.json")
 check "an import with a failing URL reports the failure" \
   '.ok == false and (.message | startswith("Imported 2 of 3 plugins · 1 failed: test.eta: ")) and (.output | test("✗ test.eta"))' "$out"
-check "imported plugins are on disk" 'true' "$([[ -d $PLUGINS/test.epsilon && -d $PLUGINS/test.zeta ]] && echo '{}')"
-check "the bar widget is put back beside its neighbour" 'true' \
-  "$(grep -qxF 'putBarWidget test.epsilon {"section":"left","before":"omarchy.menu"}' "$SHELL_LOG" && echo '{}')"
-check "the bar widget gets its settings back" 'true' \
-  "$(grep -qxF 'setBarWidget test.epsilon label "hi" {}' "$SHELL_LOG" && echo '{}')"
-check "the overlay is enabled" 'true' "$(grep -qxF test.zeta "$SHELL_ENABLED" && echo '{}')"
+holds "imported plugins are on disk" '[[ -d $PLUGINS/test.epsilon && -d $PLUGINS/test.zeta ]]'
+holds "the bar widget is put back beside its neighbour" \
+  "grep -qxF 'putBarWidget test.epsilon {\"section\":\"left\",\"before\":\"omarchy.menu\"}' \"\$SHELL_LOG\""
+holds "the bar widget gets its settings back" "grep -qxF 'setBarWidget test.epsilon label \"hi\" {}' \"\$SHELL_LOG\""
+holds "the overlay is enabled" 'grep -qxF test.zeta "$SHELL_ENABLED"'
 check "the overlay gets its inline settings in shell.json" \
   'any(.plugins[]; . == {id: "test.zeta", foo: 1})' "$(cat "$HOME/.config/omarchy/shell.json")"
 check "an import reports per plugin what it did" \
@@ -319,11 +368,12 @@ out=$("$PM" import "$SANDBOX/nowhere.json")
 check "a missing file is refused" '.ok == false and (.message | test("no file"))' "$out"
 
 # --------------------------------------------------------------- opening
-# Shortcuts come from ~/.config/hypr/*.lua, checked against a stand-in hyprctl;
-# menu entries from the user's extension over Omarchy's real defaults, whose
-# "Setup" and "Plugins" labels give the path.
+# Shortcuts come from ~/.config/hypr/*.lua, checked against the stand-in
+# hyprctl; menu entries from the user's extension over Omarchy's real defaults,
+# whose "Setup" and "Plugins" labels give the path.
 mkdir -p "$HOME/.config/hypr" "$HOME/.config/omarchy/extensions"
-cat >"$HOME/.config/hypr/bindings.lua" <<'LUA'
+BINDINGS="$HOME/.config/hypr/bindings.lua"
+cat >"$BINDINGS" <<'LUA'
 -- o.bind("SUPER + SHIFT + Z", "Old alpha", "omarchy-shell shell toggle test.alpha '{}'")
 o.bind("SUPER + SHIFT + A", "Alpha thing", "omarchy-shell shell toggle test.alpha '{}'")
 o.bind("SUPER + K", "Kappa", "omarchy-shell shell toggle test.kappa '{}'")
@@ -335,12 +385,7 @@ cat >"$HOME/.config/omarchy/extensions/omarchy-menu.jsonc" <<'JSONC'
   "setup.plugin.kappa": {"icon":"x","label":"Kappa","action":"kappa-open now"},
 }
 JSONC
-cat >"$SANDBOX/bin/hyprctl" <<'STUB'
-#!/bin/bash
-[[ "$*" == "binds -j" ]] &&
-  echo '[{"modmask": 65, "key": "A", "description": "Alpha thing", "dispatcher": "__lua", "arg": "1", "submap": ""}]'
-STUB
-chmod +x "$SANDBOX/bin/hyprctl"
+echo '[{"modmask": 65, "key": "A", "description": "Alpha thing", "dispatcher": "__lua", "arg": "1", "submap": ""}]' >"$HYPR_BINDS"
 # test.kappa: a git plugin that ships its own opener script.
 git_plugin "$PLUGINS/test.kappa" test.kappa
 mkdir -p "$PLUGINS/test.kappa/bin"
@@ -356,9 +401,11 @@ out=$("$PM" list)
 check "a shortcut in the Hyprland config is found and is live" \
   '.plugins[] | select(.id == "test.alpha") | .opens.shortcuts | map({keys, description, active}) == [{keys: "SUPER + SHIFT + A", description: "Alpha thing", active: true}]' "$out"
 check "a shortcut says where it is written" \
-  ".plugins[] | select(.id == \"test.alpha\") | .opens.shortcuts[0] | .file == \"$HOME/.config/hypr/bindings.lua\" and .line == 2" "$out"
+  ".plugins[] | select(.id == \"test.alpha\") | .opens.shortcuts[0] | .file == \"$BINDINGS\" and .line == 2" "$out"
 check "a shortcut Hyprland does not have is found but not live" \
   '.plugins[] | select(.id == "test.kappa") | .opens.shortcuts | map({keys, active}) == [{keys: "SUPER + K", active: false}]' "$out"
+check "a shortcut written by hand is not the manager's" \
+  '.plugins[] | select(.id == "test.alpha") | .opens.shortcuts[0].managed == false' "$out"
 check "a menu entry that runs a plugin's own script is found, with its path" \
   '.plugins[] | select(.id == "test.kappa") | .opens.menu == [{path: "Setup › Plugins › Kappa", action: "kappa-open now"}]' "$out"
 check "a plugin's place in the bar is listed" '.plugins[] | select(.id == "test.alpha") | .opens.bar == [{section: "right"}]' "$out"
@@ -372,6 +419,85 @@ check "Open falls back to a toggle for a plugin nothing opens" \
   ".plugins[] | select(.id == \"test.broken\") | .openCommand == \"omarchy-shell shell toggle test.broken '{}'\" and .opens == {shortcuts: [], menu: [], bar: []}" "$out"
 check "a service has nothing to open" '.plugins[] | select(.id == "test.theta") | .openCommand == ""' "$out"
 
+# ---------------------------------------------------------------- review
+echo "// review me" >>"$SANDBOX/alpha-work/Overlay.qml"
+commit_all "$SANDBOX/alpha-work" "Ask for a review"
+git -C "$SANDBOX/alpha-work" push -q origin main
+out=$("$PM" review test.alpha)
+check "a review says what an update brings in" \
+  '.ok == true and .message == "1 new commit, 1 file changed" and .entry.behind == 1 and .entry.commits[0].subject == "Ask for a review"' "$out"
+check "a review lists the changed files with their line counts" \
+  '.files == [{path: "Overlay.qml", added: 1, deleted: 0}]' "$out"
+check "a review carries the diff" '(.diff | test("\\+// review me")) and .truncated == false and .totalLines > 0' "$out"
+check "a review refreshes the cached update status" \
+  '.plugins[] | select(.id == "test.alpha") | .update.behind == 1' "$("$PM" list)"
+out=$("$PM" review test.broken)
+check "a plugin that cannot be fetched cannot be reviewed" '.ok == false and (.message | test("Could not check"))' "$out"
+out=$("$PM" review test.gamma)
+check "a plugin that is not git cannot be reviewed" '.ok == false and (.message | test("not a git plugin"))' "$out"
+
+# ------------------------------------------------------------- shortcuts
+out=$("$PM" suggest-key test.kappa)
+check "a suggestion starts from the plugin's initials" '.ok == true and .keys == "SUPER + ALT + T"' "$out"
+echo '[{"modmask": 65, "key": "A", "description": "Alpha thing"}, {"modmask": 72, "key": "T", "description": "Terminal thing"}]' >"$HYPR_BINDS"
+out=$("$PM" suggest-key test.kappa)
+check "a suggestion skips a combination that is taken" '.keys == "SUPER + CTRL + T"' "$out"
+echo '[{"modmask": 65, "key": "A", "description": "Alpha thing"}]' >"$HYPR_BINDS"
+
+out=$("$PM" keycheck "super+shift+a")
+check "a combination is spelled one way, and a taken one says by what" \
+  '.ok == true and .keys == "SUPER + SHIFT + A" and .taken == true and .takenBy == "Alpha thing"' "$out"
+out=$("$PM" keycheck "alt + super + j")
+check "a free combination is free, with the modifiers in order" '.keys == "SUPER + ALT + J" and .taken == false' "$out"
+out=$("$PM" keycheck "a")
+check "a key without a modifier is refused" '.ok == false' "$out"
+out=$("$PM" keycheck "SUPER + K + J")
+check "two keys are refused" '.ok == false' "$out"
+
+out=$("$PM" bind test.kappa "SUPER + SHIFT + A")
+check "binding a taken combination is refused and says by what" \
+  '.ok == false and .taken == true and (.message | test("taken by Alpha thing"))' "$out"
+: >"$HYPR_LOG"
+out=$("$PM" bind test.kappa "super + alt + k")
+check "bind succeeds with the combination spelled out" '.ok == true and .keys == "SUPER + ALT + K"' "$out"
+holds "the binding is written below its comment" \
+  "grep -A1 -xF -- '-- test.kappa name (test.kappa), bound by Plugin Manager' \"\$BINDINGS\" | grep -qxF 'o.bind(\"SUPER + ALT + K\", \"test.kappa name\", \"kappa-open now\")'"
+holds "Hyprland is reloaded" 'grep -qx reload "$HYPR_LOG" && grep -qx configerrors "$HYPR_LOG"'
+holds "the bindings written by hand are left alone" 'grep -qF "\"Alpha thing\"" "$BINDINGS" && grep -qF "\"Browser\"" "$BINDINGS"'
+check "the list knows the manager made it" \
+  '.plugins[] | select(.id == "test.kappa") | any(.opens.shortcuts[]; .keys == "SUPER + ALT + K" and .managed)' "$("$PM" list)"
+out=$("$PM" keycheck "SUPER + ALT + K" test.kappa)
+check "a plugin's own shortcut is no conflict for itself" '.taken == false' "$out"
+
+"$PM" bind test.kappa "SUPER + ALT + J" >/dev/null
+holds "binding again replaces the manager's block rather than adding one" \
+  '[[ $(grep -c "(test.kappa), bound by Plugin Manager" "$BINDINGS") == 1 ]] && ! grep -qF "SUPER + ALT + K" "$BINDINGS"'
+out=$("$PM" bind test.kappa "SUPER + SHIFT + A" --replace)
+check "--replace takes a combination over" '.ok == true' "$out"
+holds "taking over unbinds the combination first" \
+  "grep -A1 -xF -- '-- test.kappa name (test.kappa), bound by Plugin Manager' \"\$BINDINGS\" | grep -qxF 'hl.unbind(\"SUPER + SHIFT + A\")'"
+
+before=$(md5sum <"$BINDINGS")
+echo "error: something broke" >"$HYPR_ERRORS"
+out=$("$PM" bind test.kappa "SUPER + ALT + Q")
+check "a binding Hyprland rejects is not kept" '.ok == false and (.message | test("rejected"))' "$out"
+holds "the bindings are put back as they were" '[[ $(md5sum <"$BINDINGS") == "$before" ]]'
+: >"$HYPR_ERRORS"
+
+out=$("$PM" bind test.theta "SUPER + ALT + Z")
+check "a plugin with nothing to open gets no binding" '.ok == false and (.message | test("nothing to bind"))' "$out"
+out=$("$PM" bind test.beta "SUPER + ALT + Z")
+check "a plugin that is not git gets no binding" '.ok == false and (.message | test("not a git plugin"))' "$out"
+
+out=$("$PM" unbind test.kappa)
+check "unbind succeeds" '.ok == true' "$out"
+holds "unbind takes the whole block out" '! grep -qF "(test.kappa), bound by Plugin Manager" "$BINDINGS" && ! grep -qF "hl.unbind" "$BINDINGS"'
+holds "and nothing else" 'grep -qF "\"Alpha thing\"" "$BINDINGS" && grep -qF "\"Kappa\"" "$BINDINGS"'
+out=$("$PM" unbind test.kappa)
+check "unbinding what the manager did not make is refused" '.ok == false' "$out"
+out=$("$PM" unbind test.alpha)
+check "a binding written by hand cannot be unbound here" '.ok == false' "$out"
+
 # ------------------------------------------------------------------- run
 export PLUGIN_MANAGER_NO_SUMMON=1
 STATE="$XDG_CACHE_HOME/omarchy/plugin-manager"
@@ -380,12 +506,12 @@ check "run passes the command's reply through" '.ok == false and (.message | tes
 out=$(cat "$STATE/last-action.json")
 check "run records the reply with its label, id and kind" \
   '.label == "Enabling broken" and .id == "test.broken" and .kind == "toggle" and .result.ok == false and (.seq | length > 0)' "$out"
-check "run clears its running marker when done" 'true' "$([[ ! -e $STATE/running.json ]] && echo '{}')"
+holds "run clears its running marker when done" '[[ ! -e $STATE/running.json ]]'
 seq1=$(jq -r .seq "$STATE/last-action.json")
 "$PM" run --label "Removing broken" --id test.broken --kind remove -- remove test.broken >/dev/null
 out=$(cat "$STATE/last-action.json")
 check "a second run gets a new sequence number" ".seq != \"$seq1\" and .result.ok == true" "$out"
-check "a run really does the work" 'true' "$([[ ! -e $PLUGINS/test.broken ]] && echo '{}')"
+holds "a run really does the work" '[[ ! -e $PLUGINS/test.broken ]]'
 out=$("$PM" run --label x -- bogus)
 check "a failing command still leaves a reply" '.ok == false' "$out"
 

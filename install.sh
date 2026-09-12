@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Wire up the Plugin Manager: a shortcut and a menu entry, then enable it.
+# Wire up the Plugin Manager: a shortcut, a menu entry and the bar button.
 #
 #   ./install.sh                 pick a shortcut interactively
 #   ./install.sh --key "SUPER + ALT + P"
@@ -287,5 +287,5 @@ echo "Added Setup > Plugins > Manage Plugins to $MENU"
 if omarchy-plugin-list --json | jq -e --arg id "$ID" 'any(.[]; .id == $id and .enabled)' >/dev/null; then
   echo "$ID is already enabled"
 else
-  omarchy plugin enable "$ID"
+  omarchy plugin enable "$ID" --section right
 fi

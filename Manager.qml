@@ -5,11 +5,12 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// Plugin Manager. Lists the plugins in ~/.config/omarchy/plugins -- never the
-// built-in omarchy.* ones, and never itself -- with their details, whether an
-// update is waiting, and the actions to update, enable, disable, remove or add
-// one. Every action runs bin/plugin-manager, which wraps the stock
-// omarchy-plugin-* commands; this file only renders what comes back.
+// Plugin Manager. Lists the git plugins in ~/.config/omarchy/plugins -- never
+// the built-in omarchy.* ones -- with their details, how each one opens,
+// whether an update is waiting, and the actions to open, review and update,
+// enable, disable, bind a shortcut to, remove or add one. It lists itself too,
+// so it can update itself, but it will not switch itself off or remove itself.
+// Every action runs bin/plugin-manager; this file only renders what comes back.
 Item {
   id: root
 
@@ -38,8 +39,8 @@ Item {
   property bool listedOnce: false
   property bool relistPending: false
 
-  // Update checks, exports and import previews run in-process: none of them
-  // rescans the shell.
+  // Update checks, reviews, exports, import previews and shortcut changes run
+  // in-process: none of them rescans the shell.
   property string busyLabel: ""
   property string busyId: ""
   property string busyKind: ""
@@ -48,6 +49,18 @@ Item {
   // An import waiting on its confirmation: the dry run's reply.
   property bool confirmingImport: false
   property var importPreview: null
+
+  // An update waiting on its review: the reply of `plugin-manager review`.
+  property bool reviewing: false
+  property var review: null
+  readonly property var reviewFiles: root.review && root.review.files ? root.review.files : []
+  readonly property var reviewLines: root.review && root.review.diff
+    ? String(root.review.diff).replace(/\n$/, "").split("\n") : []
+
+  // The shortcut dialog, and what the backend made of the keys typed into it.
+  property bool binding: false
+  property var keyCheck: null
+  property string keyMode: ""
 
   // Everything else runs detached (see `plugin-manager run`), because the
   // stock commands end in a shell rescan that unloads this overlay mid-action.
@@ -71,6 +84,7 @@ Item {
 
   readonly property var current: root.selectedIndex >= 0 && root.selectedIndex < root.plugins.length
     ? root.plugins[root.selectedIndex] : null
+  readonly property bool currentIsSelf: root.current !== null && root.current.self === true
   readonly property int updateCount: {
     var n = 0
     for (var i = 0; i < root.plugins.length; i++) if (root.behind(root.plugins[i]) > 0) n++
@@ -110,7 +124,7 @@ Item {
     if (!payload || typeof payload !== "object") payload = ({})
 
     root.opened = true
-    root.confirmingRemove = false
+    root.closeDialogs()
     root.now = Date.now()
     if (payload.select) root.selectId = String(payload.select)
     root.syncJobs(true, payload.resume ? String(payload.resume) : "")
@@ -125,7 +139,17 @@ Item {
   // cut off halfway helps nobody.
   function close() {
     root.opened = false
+    root.closeDialogs()
+  }
+
+  function closeDialogs() {
     root.confirmingRemove = false
+    root.confirmingImport = false
+    root.importPreview = null
+    root.reviewing = false
+    root.review = null
+    root.binding = false
+    root.keyCheck = null
   }
 
   // User-initiated closes go through the host so its open-panel state stays in
@@ -183,6 +207,8 @@ Item {
 
   // --------------------------------------------------------------- actions
 
+  readonly property var quickKinds: ["check", "export", "preview", "review", "bind", "unbind"]
+
   // One action at a time: they all end in the stock commands, which rescan
   // the shell and would trip over each other.
   function runAction(args, label, id, kind, quiet) {
@@ -192,9 +218,8 @@ Item {
     }
     if (!quiet) root.setStatus("", false)
 
-    // Checks, exports and import previews run in-process: none of them ends
-    // in a rescan, so nothing unloads the overlay under them.
-    if (kind === "check" || kind === "export" || kind === "preview") {
+    // These end in no rescan, so nothing unloads the overlay under them.
+    if (root.quickKinds.indexOf(kind) !== -1) {
       root.busyLabel = label
       root.busyId = id || ""
       root.busyKind = kind
@@ -229,6 +254,8 @@ Item {
     } else if (kind === "preview") {
       root.showImportPreview(payload)
       return
+    } else if (kind === "review") {
+      root.showReview(payload)
     } else {
       root.setStatus(payload.message, false)
     }
@@ -323,6 +350,8 @@ Item {
     root.runAction(["check"], "Checking for updates", "", "check", false)
   }
 
+  // An update is reviewed first: the backend fetches and shows what it brings
+  // in, and nothing changes until the review is confirmed.
   function updateCurrent() {
     var p = root.current
     if (!p) return
@@ -330,12 +359,69 @@ Item {
       root.setStatus(p.name + " is already up to date", false)
       return
     }
-    root.runAction(["update", p.id], "Updating " + p.name, p.id, "update", false)
+    root.runAction(["review", p.id], "Reading the changes to " + p.name, p.id, "review", false)
+  }
+
+  function showReview(payload) {
+    if (!payload.entry || payload.entry.behind === 0) {
+      root.setStatus(payload.message, false)
+      return
+    }
+    root.review = payload
+    root.reviewing = true
+    Qt.callLater(function() { reviewList.contentY = 0 })
+  }
+
+  function cancelReview() {
+    root.reviewing = false
+    root.review = null
+    keyCatcher.forceActiveFocus()
+  }
+
+  function confirmUpdate() {
+    var r = root.review
+    root.reviewing = false
+    root.review = null
+    keyCatcher.forceActiveFocus()
+    if (!r) return
+    var isSelf = r.id === root.pluginId
+    root.runAction(["update", r.id], "Updating " + r.name, r.id, isSelf ? "self-update" : "update", false)
+  }
+
+  function scrollReview(dy) {
+    var max = Math.max(0, reviewList.contentHeight - reviewList.height)
+    reviewList.contentY = Math.max(0, Math.min(max, reviewList.contentY + dy))
+  }
+
+  function reviewKey(event) {
+    var key = event.key
+    var t = event.text
+    var line = Style.font.caption + Style.spacing.xxs
+    if (key === Qt.Key_Escape) root.cancelReview()
+    else if (key === Qt.Key_Return || key === Qt.Key_Enter) root.confirmUpdate()
+    else if (key === Qt.Key_Down || t === "j") root.scrollReview(line * 3)
+    else if (key === Qt.Key_Up || t === "k") root.scrollReview(-line * 3)
+    else if (key === Qt.Key_PageDown || key === Qt.Key_Space) root.scrollReview(reviewList.height * 0.9)
+    else if (key === Qt.Key_PageUp) root.scrollReview(-reviewList.height * 0.9)
+    else if (key === Qt.Key_Home) reviewList.contentY = 0
+    else if (key === Qt.Key_End) root.scrollReview(reviewList.contentHeight)
+  }
+
+  function diffColor(line) {
+    if (/^(\+\+\+|---|diff |index |new file|deleted file|similarity|rename )/.test(line)) return root.muted
+    if (line.charAt(0) === "+") return root.accent
+    if (line.charAt(0) === "-") return root.urgent
+    if (line.indexOf("@@") === 0) return root.selectedText
+    return root.foreground
   }
 
   function toggleEnabled() {
     var p = root.current
     if (!p) return
+    if (p.self) {
+      root.setStatus("The Plugin Manager does not switch itself off", false)
+      return
+    }
     if (!p.enabled && !p.valid) {
       root.setStatus(p.name + " cannot be enabled: " + p.validationError, true)
       return
@@ -345,7 +431,12 @@ Item {
   }
 
   function askRemove() {
-    if (!root.current || root.busy) return
+    var p = root.current
+    if (!p || root.busy) return
+    if (p.self) {
+      root.setStatus("The Plugin Manager does not remove itself; use omarchy plugin remove", false)
+      return
+    }
     confirm.selectedIndex = 0
     root.confirmingRemove = true
   }
@@ -439,7 +530,7 @@ Item {
   // menu entry would; the backend picks that command, or a plain toggle.
   function openPlugin() {
     var p = root.current
-    if (!p) return
+    if (!p || p.self) return
     if (!p.openCommand) {
       root.setStatus(p.name + " has no window to open; it runs in the background", false)
       return
@@ -450,6 +541,81 @@ Item {
     }
     root.dismiss()
     Quickshell.execDetached(["sh", "-c", p.openCommand])
+  }
+
+  // -------------------------------------------------------------- shortcuts
+
+  // The shortcut dialog proposes a free combination made from the plugin's
+  // name, checks whatever is typed against Hyprland as it changes, and binds it
+  // to what Open runs.
+  function askBind() {
+    var p = root.current
+    if (!p) return
+    if (!p.openCommand) {
+      root.setStatus(p.name + " has no window to open, so there is nothing to bind", false)
+      return
+    }
+    root.keyCheck = null
+    bindField.text = ""
+    root.binding = true
+    Qt.callLater(function() { bindField.forceActiveFocus() })
+    root.runKeys(["suggest-key", p.id], "suggest")
+  }
+
+  function closeBind() {
+    root.binding = false
+    root.keyCheck = null
+    keyCatcher.forceActiveFocus()
+  }
+
+  function runKeys(args, mode) {
+    keyProc.running = false
+    root.keyMode = mode
+    keyProc.command = [root.backend].concat(args)
+    keyProc.running = true
+  }
+
+  function applyKeys(text) {
+    var payload = root.parseJson(text)
+    if (root.keyMode === "suggest") {
+      // Setting the text sets off the check of what was suggested.
+      if (payload && payload.ok && payload.keys && bindField.text === "") bindField.text = payload.keys
+      return
+    }
+    root.keyCheck = payload
+  }
+
+  function saveBind() {
+    var p = root.current
+    var c = root.keyCheck
+    if (!p || !c || !c.ok || keyCheckTimer.running || keyProc.running) return
+    var args = ["bind", p.id, c.keys]
+    if (c.taken) args.push("--replace")
+    root.closeBind()
+    root.runAction(args, "Binding " + c.keys + " to " + p.name, p.id, "bind", false)
+  }
+
+  function removeBind() {
+    var p = root.current
+    if (!p) return
+    root.closeBind()
+    root.runAction(["unbind", p.id], "Removing the shortcut for " + p.name, p.id, "unbind", false)
+  }
+
+  function managedShortcut(p) {
+    var shortcuts = p && p.opens ? p.opens.shortcuts : []
+    for (var i = 0; i < shortcuts.length; i++) if (shortcuts[i].managed) return shortcuts[i]
+    return null
+  }
+
+  function bindStatus() {
+    var c = root.keyCheck
+    if (!bindField.text.trim()) return { text: "Type a combination, like SUPER + ALT + D", color: root.muted }
+    if (keyCheckTimer.running || keyProc.running || !c) return { text: "Checking …", color: root.muted }
+    if (!c.ok) return { text: c.message, color: root.urgent }
+    if (c.taken) return { text: c.keys + " is taken by " + (c.takenBy || "another binding") + "; saving takes it over",
+                          color: root.urgent }
+    return { text: c.keys + " is free", color: root.accent }
   }
 
   // ------------------------------------------------------------- helpers
@@ -494,8 +660,12 @@ Item {
     return Math.floor(s / 86400) + " d ago"
   }
 
-  function branchLabel(p) {
-    return p && p.git && p.git.branch ? p.git.branch : ""
+  function subtitle(p) {
+    var parts = []
+    if (p.version) parts.push("v" + p.version)
+    if (p.git && p.git.branch) parts.push(p.git.branch)
+    if (p.self) parts.push("this manager")
+    return parts.join("  ·  ")
   }
 
   // A browsable page for the remote, when there is one: https remotes as they
@@ -548,6 +718,7 @@ Item {
     for (var i = 0; i < opens.shortcuts.length; i++) {
       var s = opens.shortcuts[i]
       add("Shortcut", s.keys + (s.description ? "  ·  " + s.description : "")
+                      + (s.managed ? "  (set here)" : "")
                       + (s.active === false ? "  (not active)" : ""))
     }
     for (var j = 0; j < opens.menu.length; j++) add("Menu", opens.menu[j].path)
@@ -563,6 +734,16 @@ Item {
   }
 
   function handleKey(event) {
+    if (root.reviewing) {
+      root.reviewKey(event)
+      event.accepted = true
+      return
+    }
+    if (root.binding) {
+      if (event.key === Qt.Key_Escape) root.closeBind()
+      event.accepted = true
+      return
+    }
     if (root.confirmingRemove || root.confirmingImport) {
       confirm.handleKey(event)
       event.accepted = true
@@ -580,6 +761,7 @@ Item {
     else if (t === "C") root.checkAll()
     else if (t === "u") root.updateCurrent()
     else if (t === "e") root.toggleEnabled()
+    else if (t === "s") root.askBind()
     else if (t === "d" || key === Qt.Key_Delete) root.askRemove()
     else if (t === "a" || t === "/") urlField.forceActiveFocus()
     else if (t === "x") root.exportPlugins()
@@ -614,7 +796,25 @@ Item {
       onStreamFinished: root.applyQuick(text)
     }
     stderr: StdioCollector {
-      onStreamFinished: if (text.trim().length > 0) console.warn(root.pluginId + " check:", text.trim())
+      onStreamFinished: if (text.trim().length > 0) console.warn(root.pluginId + " action:", text.trim())
+    }
+  }
+
+  // Suggestions and checks for the shortcut dialog, apart from quickProc so
+  // typing never waits on an action.
+  Process {
+    id: keyProc
+    stdout: StdioCollector {
+      onStreamFinished: root.applyKeys(text)
+    }
+  }
+
+  Timer {
+    id: keyCheckTimer
+    interval: 250
+    onTriggered: {
+      var keys = bindField.text.trim()
+      if (keys && root.current) root.runKeys(["keycheck", keys, root.current.id], "check")
     }
   }
 
@@ -858,8 +1058,7 @@ Item {
                   width: parent.width
                   elide: Text.ElideRight
                   textFormat: Text.PlainText
-                  text: [row.modelData.version ? "v" + row.modelData.version : "", root.branchLabel(row.modelData)]
-                    .filter(function(part) { return part !== "" }).join("  ·  ")
+                  text: root.subtitle(row.modelData)
                   color: root.muted
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1097,13 +1296,23 @@ Item {
             spacing: Style.spacing.controlGap
 
             Button {
-              visible: root.current !== null
+              visible: root.current !== null && !root.currentIsSelf
               bordered: true
               foreground: root.current && root.current.openCommand && root.current.enabled ? root.foreground : root.muted
               fontFamily: root.fontFamily
               text: "Open"
               tooltipText: "Close the manager and open this plugin  (⏎)"
               onClicked: root.openPlugin()
+            }
+
+            Button {
+              visible: root.current !== null
+              bordered: true
+              foreground: root.current && root.current.openCommand ? root.foreground : root.muted
+              fontFamily: root.fontFamily
+              text: "Shortcut…"
+              tooltipText: "Bind a key combination that opens this plugin  (s)"
+              onClicked: root.askBind()
             }
 
             Button {
@@ -1122,11 +1331,12 @@ Item {
               foreground: root.behind(root.current) > 0 ? root.accent : root.foreground
               fontFamily: root.fontFamily
               text: root.behind(root.current) > 0 ? "Update (" + root.behind(root.current) + ")" : "Update"
-              tooltipText: "Fast-forward to upstream  (u)"
+              tooltipText: "Review what an update brings in, then update  (u)"
               onClicked: root.updateCurrent()
             }
 
             Button {
+              visible: !root.currentIsSelf
               bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -1147,6 +1357,7 @@ Item {
 
             // Plain like the rest: the confirmation is where it turns red.
             Button {
+              visible: !root.currentIsSelf
               bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -1182,7 +1393,7 @@ Item {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
-            text: "↑↓ select   ⏎ open   c check   u update   e enable   d remove   a add/import   x export   o repo   esc close"
+            text: "↑↓ select   ⏎ open   s shortcut   c check   u update   e enable   d remove   a add/import   x export   o repo   esc close"
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -1217,6 +1428,357 @@ Item {
         onConfirmed: {
           if (root.confirmingImport) root.importConfirmed()
           else root.removeCurrent()
+        }
+      }
+
+      // ------------------------------------------------------------ review
+      // What an update brings in: the files it changes and the diff, read
+      // before anything is touched.
+      Item {
+        id: reviewDialog
+        anchors.fill: parent
+        visible: root.reviewing
+
+        Rectangle {
+          anchors.fill: parent
+          color: Util.alpha(root.background, 0.7)
+
+          MouseArea {
+            anchors.fill: parent
+            onClicked: root.cancelReview()
+          }
+        }
+
+        BorderSurface {
+          id: reviewCard
+          anchors.fill: parent
+          anchors.margins: Style.space(24)
+          color: root.background
+          borderSpec: Border.flat(root.accent, Style.normalBorderWidth)
+          padding: Style.space(18)
+          radius: root.cornerRadius
+
+          MouseArea {
+            anchors.fill: parent
+            onClicked: keyCatcher.forceActiveFocus()
+          }
+
+          Item {
+            anchors.fill: parent
+            anchors.topMargin: reviewCard.contentTopInset
+            anchors.rightMargin: reviewCard.contentRightInset
+            anchors.bottomMargin: reviewCard.contentBottomInset
+            anchors.leftMargin: reviewCard.contentLeftInset
+
+            Text {
+              id: reviewTitle
+              anchors { left: parent.left; right: parent.right; top: parent.top }
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              text: root.review ? "Update " + root.review.name + "?" : ""
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.heading
+              font.bold: true
+            }
+
+            Text {
+              id: reviewSummary
+              anchors { left: parent.left; right: parent.right; top: reviewTitle.bottom; topMargin: Style.spacing.md }
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              text: {
+                var r = root.review
+                if (!r) return ""
+                var parts = [r.message]
+                var p = null
+                for (var i = 0; i < root.plugins.length; i++) if (root.plugins[i].id === r.id) p = root.plugins[i]
+                if (r.entry && r.entry.remoteVersion && p && r.entry.remoteVersion !== p.version)
+                  parts.push((p.version || "?") + " → " + r.entry.remoteVersion)
+                var text = parts.join("  ·  ")
+                if (r.id === root.pluginId) text += "\nThe shell restarts afterwards, to load the new version."
+                return text
+              }
+            }
+
+            Column {
+              id: reviewFileList
+              anchors { left: parent.left; right: parent.right; top: reviewSummary.bottom; topMargin: Style.spacing.lg }
+              spacing: Style.spacing.xxs
+
+              Repeater {
+                model: root.reviewFiles.slice(0, 8)
+
+                Row {
+                  id: fileRow
+                  required property var modelData
+                  spacing: Style.spacing.lg
+
+                  Text {
+                    width: Style.space(44)
+                    horizontalAlignment: Text.AlignRight
+                    textFormat: Text.PlainText
+                    text: fileRow.modelData.added === null ? "bin" : "+" + fileRow.modelData.added
+                    color: root.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    width: Style.space(44)
+                    textFormat: Text.PlainText
+                    text: fileRow.modelData.deleted === null ? "" : "−" + fileRow.modelData.deleted
+                    color: root.urgent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    width: reviewFileList.width - Style.space(88) - Style.spacing.lg * 2
+                    elide: Text.ElideMiddle
+                    textFormat: Text.PlainText
+                    text: fileRow.modelData.path
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+
+              Text {
+                visible: root.reviewFiles.length > 8
+                textFormat: Text.PlainText
+                text: "and " + (root.reviewFiles.length - 8) + " more files"
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Rectangle {
+              id: reviewRule
+              anchors { left: parent.left; right: parent.right; top: reviewFileList.bottom; topMargin: Style.spacing.lg }
+              height: 1
+              color: root.faint
+            }
+
+            ListView {
+              id: reviewList
+              anchors {
+                left: parent.left; right: parent.right
+                top: reviewRule.bottom; topMargin: Style.spacing.md
+                bottom: reviewFooter.top; bottomMargin: Style.spacing.md
+              }
+              clip: true
+              model: root.reviewLines
+              boundsBehavior: Flickable.StopAtBounds
+
+              delegate: Text {
+                required property string modelData
+                width: reviewList.width
+                elide: Text.ElideRight
+                textFormat: Text.PlainText
+                text: modelData.length > 400 ? modelData.slice(0, 400) : modelData
+                color: root.diffColor(modelData)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Item {
+              id: reviewFooter
+              anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+              height: reviewButtons.implicitHeight
+
+              Text {
+                anchors.left: parent.left
+                anchors.right: reviewButtons.left
+                anchors.rightMargin: Style.spacing.xl
+                anchors.verticalCenter: parent.verticalCenter
+                elide: Text.ElideRight
+                textFormat: Text.PlainText
+                text: root.review && root.review.truncated
+                  ? "Showing the first " + root.reviewLines.length + " of " + root.review.totalLines + " lines   ·   ↑↓ PgUp PgDn scroll"
+                  : "↑↓ PgUp PgDn scroll   ⏎ update   esc cancel"
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Row {
+                id: reviewButtons
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.spacing.controlGap
+
+                Button {
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  text: "Cancel"
+                  onClicked: root.cancelReview()
+                }
+
+                Button {
+                  bordered: true
+                  foreground: root.accent
+                  fontFamily: root.fontFamily
+                  text: "Update"
+                  onClicked: root.confirmUpdate()
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // ---------------------------------------------------------- shortcut
+      Item {
+        id: bindDialog
+        anchors.fill: parent
+        visible: root.binding
+
+        Rectangle {
+          anchors.fill: parent
+          color: Util.alpha(root.background, 0.7)
+
+          MouseArea {
+            anchors.fill: parent
+            onClicked: root.closeBind()
+          }
+        }
+
+        BorderSurface {
+          id: bindCard
+          width: Math.min(parent.width - Style.space(32), Style.space(480))
+          height: bindCard.contentTopInset + bindCard.contentBottomInset + bindColumn.implicitHeight
+          anchors.centerIn: parent
+          color: root.background
+          borderSpec: Border.flat(root.accent, Style.normalBorderWidth)
+          padding: Style.space(18)
+          radius: root.cornerRadius
+
+          MouseArea {
+            anchors.fill: parent
+            onClicked: bindField.forceActiveFocus()
+          }
+
+          Column {
+            id: bindColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.topMargin: bindCard.contentTopInset
+            anchors.leftMargin: bindCard.contentLeftInset
+            anchors.rightMargin: bindCard.contentRightInset
+            spacing: Style.spacing.lg
+
+            Text {
+              width: parent.width
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              text: root.current ? "Shortcut for " + root.current.name : ""
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WrapAnywhere
+              textFormat: Text.PlainText
+              text: root.current ? "Runs: " + root.current.openCommand : ""
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            TextField {
+              id: bindField
+              width: parent.width
+              foreground: root.foreground
+              placeholderText: "SUPER + ALT + D"
+              onTextChanged: {
+                root.keyCheck = null
+                keyCheckTimer.restart()
+              }
+              Keys.onReturnPressed: function(event) {
+                root.saveBind()
+                event.accepted = true
+              }
+              Keys.onEnterPressed: function(event) {
+                root.saveBind()
+                event.accepted = true
+              }
+              Keys.onEscapePressed: function(event) {
+                root.closeBind()
+                event.accepted = true
+              }
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              readonly property var state: root.bindStatus()
+              text: state.text
+              color: state.color
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              width: parent.width
+              visible: root.managedShortcut(root.current) !== null
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: root.managedShortcut(root.current)
+                ? "Now: " + root.managedShortcut(root.current).keys + ", set here earlier. Saving moves it." : ""
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Item {
+              width: parent.width
+              height: bindButtons.implicitHeight
+
+              Row {
+                id: bindButtons
+                anchors.right: parent.right
+                spacing: Style.spacing.controlGap
+
+                Button {
+                  visible: root.managedShortcut(root.current) !== null
+                  bordered: true
+                  foreground: root.urgent
+                  fontFamily: root.fontFamily
+                  text: "Remove shortcut"
+                  onClicked: root.removeBind()
+                }
+
+                Button {
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  text: "Cancel"
+                  onClicked: root.closeBind()
+                }
+
+                Button {
+                  bordered: true
+                  foreground: root.keyCheck && root.keyCheck.ok ? root.accent : root.muted
+                  fontFamily: root.fontFamily
+                  text: root.keyCheck && root.keyCheck.ok && root.keyCheck.taken ? "Take over" : "Save"
+                  onClicked: root.saveBind()
+                }
+              }
+            }
+          }
         }
       }
     }

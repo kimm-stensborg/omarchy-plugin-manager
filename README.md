@@ -1,24 +1,27 @@
 # Plugin Manager
 
 One place to look after the Omarchy shell plugins you installed from git:
-list them, read their details, see how each one is opened and open it, see
-which have updates waiting, update, enable, disable, remove, add new ones from
-a git URL, and carry the whole set to another Omarchy install with an export
-file.
+list them, read their details, see how each one opens and open it, give it a
+shortcut, see which have updates waiting, review what an update brings in
+before installing it, enable, disable, remove, add new ones from a git URL,
+and carry the whole set to another Omarchy install with an export file.
 
 - **Plugin ID:** `io.github.kimm-stensborg.plugin-manager`
-- **Kind:** `overlay`
+- **Kinds:** `overlay`, `bar-widget`
 - **License:** MIT
 - **Requires:** Omarchy 4 (Quattro) with `omarchy-shell`; `git`, `jq`
 
 It manages **git plugins only**: the checkouts `omarchy plugin add` makes in
-`~/.config/omarchy/plugins/`. Everything else is left alone, and so is the
-manager itself:
+`~/.config/omarchy/plugins/`. Everything else is left alone:
 
 - the built-in `omarchy.*` plugins
 - clones of built-ins
 - folders dropped in by hand
 - symlinks to working copies
+
+The manager lists **itself** too, so it can check for and install its own
+updates. It will not switch itself off or remove itself; use
+`omarchy plugin remove` for that.
 
 ## Install
 
@@ -27,7 +30,7 @@ omarchy plugin add https://github.com/kimm-stensborg/omarchy-plugin-manager.git
 ~/.config/omarchy/plugins/io.github.kimm-stensborg.plugin-manager/install.sh
 ```
 
-`install.sh` enables the plugin and gives you two ways to open it:
+`install.sh` gives you three ways in:
 
 - a **shortcut**. It proposes the first free one of `SUPER + ALT + P`,
   `SUPER + CTRL + SHIFT + P`, `SUPER + SHIFT + U` and `SUPER + ALT + U`, and
@@ -35,10 +38,12 @@ omarchy plugin add https://github.com/kimm-stensborg/omarchy-plugin-manager.git
   `~/.config/hypr/bindings.lua`.
 - a **menu entry**, *Setup › Plugins › Manage Plugins*, in
   `~/.config/omarchy/extensions/omarchy-menu.jsonc`.
+- the **bar button**. Enabling the plugin puts it in the right section. It
+  shows a badge with the number of plugins that have an update.
 
 ```bash
 install.sh --key "SUPER + ALT + P"   # skip the prompt
-install.sh --no-bind                 # menu entry only
+install.sh --no-bind                 # menu entry and bar button only
 install.sh --uninstall               # take the shortcut and menu entry out
 ```
 
@@ -54,9 +59,10 @@ omarchy-shell shell toggle io.github.kimm-stensborg.plugin-manager '{}'
 |-----|------|
 | `↑` `↓` / `j` `k`, `Home` `End` | select a plugin |
 | `⏎` | open the selected plugin |
+| `s` | give it a shortcut, or change or remove the one it has |
 | `c` | check the selected plugin for an update |
 | `C` | check every plugin |
-| `u` | update the selected plugin |
+| `u` | review its update, then install it |
 | `e` | enable or disable it |
 | `d` / `Del` | remove it (asks first) |
 | `a` / `/` | type a git URL to add, or an export file to import; `⏎` goes, `Esc` leaves the field |
@@ -78,6 +84,35 @@ For every plugin:
 Problems are called out: a manifest the validator rejects, local changes that
 would stop an update from fast-forwarding, and a checkout that has diverged
 from upstream.
+
+## Updates
+
+A check does the same fetch as `omarchy plugin update`, so "3 new commits"
+means exactly what an update would bring in. The commits are listed, along
+with the version the upstream manifest declares.
+
+**The bar button** counts the plugins with an update waiting. It checks at
+startup and every six hours after that. When a check finds a plugin that
+newly has an update, you get a desktop notification, and clicking it opens
+the manager. Each update is announced once, not at every check. A lock keeps
+the bar on each monitor from checking at the same time. Opening the manager
+also redoes a check that is more than six hours old, and `C` checks again at
+any time.
+
+The results are cached in `~/.cache/omarchy/plugin-manager/updates.json`.
+
+### Reviewing an update
+
+`u` does not update straight away. It fetches, then shows what the update
+brings in: the commits, the files it changes with their added and removed
+lines, and the diff itself (up to 3000 lines). Nothing changes until you
+confirm with `⏎` or **Update**; `Esc` leaves the plugin as it is. Plugins run
+unsandboxed inside `omarchy-shell`, so this is the moment to read what you
+are about to run.
+
+When the manager updates **itself**, the shell restarts afterwards. A running
+shell keeps the old version of the manager until it restarts, so that is the
+only way the new version loads.
 
 ## Opening a plugin
 
@@ -102,15 +137,27 @@ command its own shortcut or menu entry runs. When it has neither, Open uses a
 plain `omarchy-shell shell toggle <id> '{}'`. A plugin that only runs in the
 background has nothing to open, and a disabled one has to be enabled first.
 
-## Updates
+### Giving a plugin a shortcut
 
-A check does the same fetch as `omarchy plugin update`, so "3 new commits"
-means exactly what an update would bring in. The commits are listed, along
-with the version the upstream manifest declares.
+`s`, or **Shortcut…**, proposes a free combination made from the plugin's
+name. It tries the initials first, then the other letters, each with
+`SUPER + ALT`, `SUPER + CTRL`, `SUPER + CTRL + SHIFT` and `SUPER + SHIFT + ALT`.
+Type over it if you want something else. The dialog checks what you type
+against Hyprland as you go: a combination that is free says so, and one that
+is taken says by what. Saving a taken one takes it over, unbinding it first.
 
-The results are cached in `~/.cache/omarchy/plugin-manager/updates.json`.
-Opening the manager redoes a check that is more than six hours old, and `C`
-checks again at any time.
+The shortcut runs the same command as Open, and is written to
+`~/.config/hypr/bindings.lua` as a block with its own comment:
+
+```lua
+-- Default Applications (io.github.kimm-stensborg.default-apps), bound by Plugin Manager
+o.bind("SUPER + ALT + D", "Default Applications", "omarchy-shell shell toggle io.github.kimm-stensborg.default-apps '{}'")
+```
+
+Hyprland is reloaded. If it reports a config error, the file is put back as
+it was and nothing is kept. The comment is how the manager finds its own
+blocks again, so it can move a shortcut or remove it (**Remove shortcut**).
+It never edits a binding it did not write.
 
 ## Adding
 
@@ -139,7 +186,9 @@ when the other bar has it, and with the same settings.
 
 A plugin whose remote another machine cannot fetch from is not included, and
 the preview says why: one with no remote, or one whose remote is a path on
-this disk. Plugins that are already installed are left as they are.
+this disk. The manager itself is not included either, since the other
+machine needs it installed to import anything. Plugins that are already
+installed are left as they are.
 
 From a terminal:
 
@@ -153,15 +202,17 @@ bin/plugin-manager import <file>
 
 | Path | What |
 |------|------|
-| `Manager.qml` | the overlay: list, details, actions |
+| `Manager.qml` | the overlay: list, details, actions, review and shortcut dialogs |
+| `BarWidget.qml` | the bar button, its update badge and the periodic check |
 | `bin/plugin-manager` | the backend; the only code that touches the system |
-| `install.sh` | shortcut, menu entry, enable |
+| `install.sh` | shortcut, menu entry, bar button |
 | `test.sh` | backend tests |
 
-The backend prints one JSON document per command (`list`, `check`, `update`,
-`remove`, `add`, `enable`, `disable`, `export`, `import`). The actions wrap
-the stock `omarchy-plugin-*` commands, so cloning, validation, rollback and
-rescans work exactly as they do from the terminal.
+The backend prints one JSON document per command: `list`, `check`, `review`,
+`update`, `remove`, `add`, `enable`, `disable`, `suggest-key`, `keycheck`,
+`bind`, `unbind`, `export` and `import` (`--help` lists them). The actions
+wrap the stock `omarchy-plugin-*` commands, so cloning, validation, rollback
+and rescans work exactly as they do from the terminal.
 
 Those commands finish by rescanning the shell, and a rescan unloads every open
 panel, this one included. So the overlay does not wait on them. It starts
@@ -174,7 +225,8 @@ panel, this one included. So the overlay does not wait on them. It starts
 The manager is gone for a second or two while the shell rebuilds its panels;
 no plugin can stay on screen through that.
 
-Checks, exports and import previews do not rescan, so they run directly.
+Checks, reviews, exports, import previews and shortcut changes do not rescan,
+so they run directly.
 
 ## Remove
 
@@ -183,6 +235,10 @@ Checks, exports and import previews do not rescan, so they run directly.
 omarchy plugin remove io.github.kimm-stensborg.plugin-manager
 rm -rf ~/.cache/omarchy/plugin-manager
 ```
+
+Shortcuts the manager gave to other plugins stay in
+`~/.config/hypr/bindings.lua`. Remove them with **Remove shortcut** first, or
+delete their blocks by hand.
 
 ## Developing
 
@@ -199,7 +255,7 @@ fast-forward over local changes.
 
 A rescan does not pick up changed QML: the shell keeps the compiled component
 cached for as long as the old instance is alive, so after changing
-`Manager.qml` run `omarchy restart shell`. Errors land in
+`Manager.qml` or `BarWidget.qml` run `omarchy restart shell`. Errors land in
 `/run/user/$UID/quickshell/by-id/*/log.log`. To drive the overlay without
 touching the keyboard, `omarchy-shell shell call <id> <function> x` calls any
 of its functions, for example `toggleEnabled` or `checkAll`.
@@ -211,6 +267,6 @@ of its functions, for example `toggleEnabled` or `checkAll`.
 ```
 
 The tests run the backend against a throwaway `$HOME`, using fake plugins and
-local bare repositories as their upstreams. A stand-in `omarchy-shell` first on
-`PATH` answers in place of the running shell, so no test touches your real
-plugins or `shell.json`.
+local bare repositories as their upstreams. Stand-ins for `omarchy-shell`,
+`hyprctl` and `omarchy-notification-send` sit first on `PATH`, so no test
+touches your real plugins, `shell.json`, Hyprland config or notifications.

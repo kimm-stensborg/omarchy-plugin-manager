@@ -6,20 +6,26 @@
 # cloning, validation, rollback and shell rescans stay Omarchy's business.
 #
 #   plugin-manager list
-#   plugin-manager check [id] [--if-stale SECONDS]
+#   plugin-manager check [id] [--if-stale SECONDS] [--notify]
+#   plugin-manager review <id>
 #   plugin-manager update <id>
 #   plugin-manager remove <id>
 #   plugin-manager add <git-url>
 #   plugin-manager enable <id>
 #   plugin-manager disable <id>
+#   plugin-manager suggest-key <id>
+#   plugin-manager keycheck <keys> [id]
+#   plugin-manager bind <id> <keys> [--replace]
+#   plugin-manager unbind <id>
 #   plugin-manager export [file]
 #   plugin-manager import <file> [--dry-run]
 #   plugin-manager run --label L --id ID --kind K -- <command...>
 #
 # Only git plugins are managed: the checkouts `omarchy plugin add` makes in
 # ~/.config/omarchy/plugins. Clones of built-ins, folders dropped in by hand
-# and symlinks are left alone, as are the built-in omarchy.* plugins -- and so
-# is the manager itself.
+# and symlinks are left alone, as are the built-in omarchy.* plugins. The
+# manager lists itself too, so it can be checked and updated, but it will not
+# remove itself or switch itself off.
 
 set -uo pipefail
 
@@ -28,11 +34,34 @@ PLUGINS_DIR="$HOME/.config/omarchy/plugins"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/plugin-manager"
 CACHE="$CACHE_DIR/updates.json"
 MAX_COMMITS=20
+MAX_DIFF_LINES=3000
+PLUGIN_GLYPH=$'\U000f0431'
 
 # The same non-interactive git as omarchy-plugin-update: a fetch has to fail
 # rather than wait for a password nobody can type into an overlay.
 export GIT_TERMINAL_PROMPT=0
 export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
+
+# Key combinations, shared by every jq program that reads or writes one.
+# combo turns "SUPER + SHIFT + L" into the modifier mask and key hyprctl
+# reports; keylabel turns that back into the one spelling this file writes.
+JQ_KEYS='
+def combo:
+  {"SUPER": 64, "MOD": 64, "WIN": 64, "LOGO": 64, "SHIFT": 1, "CTRL": 4, "CONTROL": 4, "ALT": 8, "MOD1": 8} as $mods
+  | [split("+")[] | gsub("^\\s+|\\s+$"; "") | ascii_upcase | select(. != "")] as $parts
+  | [$parts[] | select($mods[.] == null)] as $keys
+  | { modmask: ([$parts[] | $mods[.] // empty] | unique | add // 0),
+      key: ($keys | last // ""),
+      single: (($keys | length) == 1) };
+def keylabel:
+  [ (if ((.modmask / 64) | floor) % 2 == 1 then "SUPER" else empty end),
+    (if ((.modmask / 4) | floor) % 2 == 1 then "CTRL" else empty end),
+    (if .modmask % 2 == 1 then "SHIFT" else empty end),
+    (if ((.modmask / 8) | floor) % 2 == 1 then "ALT" else empty end),
+    .key ] | join(" + ");
+def takenby($live; $c):
+  [($live // [])[] | select(.modmask == $c.modmask and (.key | ascii_upcase) == $c.key)];
+'
 
 # ------------------------------------------------------------------ output
 
@@ -53,6 +82,11 @@ last_line() {
   awk 'NF { line = $0 } END { print line }' <<<"$1"
 }
 
+# plural <n> <word> -- "1 file", "3 files".
+plural() {
+  if (($1 == 1)); then echo "1 $2"; else echo "$1 $2s"; fi
+}
+
 # ------------------------------------------------------------------- ids
 
 valid_id() {
@@ -65,14 +99,24 @@ is_git_plugin() {
   [[ -d $PLUGINS_DIR/$1/.git && ! -L $PLUGINS_DIR/$1 ]]
 }
 
-# A plugin the manager may act on: a git plugin other than the manager itself.
+# A plugin the manager may act on: any git plugin, the manager included.
 require_managed() {
   local id="$1"
   [[ -n $id ]] || fail "a plugin id is required"
   valid_id "$id" || fail "invalid plugin id '$id'"
-  [[ $id != "$SELF_ID" ]] || fail "the plugin manager does not manage itself"
   [[ -e $PLUGINS_DIR/$id || -L $PLUGINS_DIR/$id ]] || fail "plugin '$id' is not installed"
   is_git_plugin "$id" || fail "'$id' is not a git plugin, and git plugins are all the manager handles"
+}
+
+# refuse_self <id> <verb> -- the things the manager will not do to itself.
+refuse_self() {
+  [[ $1 != "$SELF_ID" ]] || fail "the plugin manager does not $2 itself"
+}
+
+plugin_name() {
+  local name
+  name=$(jq -r '.name // empty' "$PLUGINS_DIR/$1/manifest.json" 2>/dev/null)
+  printf '%s\n' "${name:-$1}"
 }
 
 # Folder names, which are what omarchy-plugin-update and -remove take. Dot
@@ -81,7 +125,7 @@ managed_ids() {
   [[ -d $PLUGINS_DIR ]] || return 0
   local id
   while IFS= read -r id; do
-    [[ $id != "$SELF_ID" ]] && is_git_plugin "$id" && printf '%s\n' "$id"
+    is_git_plugin "$id" && printf '%s\n' "$id"
   done < <(find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' | sort)
   return 0
 }
@@ -97,19 +141,20 @@ read_cache() {
 }
 
 # update_cache [jq-args...] <filter> -- applies filter to the cache under a
-# lock, since a check, an update and a detached job can all write it at once.
-# The new content is built aside and renamed into place, so a reader never
-# sees half of it.
+# lock, since the overlay and a bar widget per monitor can all write it.
+#
+# The new content is built aside but written over the old file rather than
+# renamed onto it: the bar widget's FileView watches the file, and a rename
+# swaps the inode out from under the watch so the badge never hears of it.
 update_cache() {
   mkdir -p "$CACHE_DIR"
   (
     flock 9
     tmp=$(mktemp "$CACHE_DIR/.updates.XXXXXX")
     if read_cache | jq "$@" >"$tmp"; then
-      mv "$tmp" "$CACHE"
-    else
-      rm -f "$tmp"
+      cat "$tmp" >"$CACHE"
     fi
+    rm -f "$tmp"
   ) 9>"$CACHE_DIR/cache.lock"
 }
 
@@ -143,11 +188,12 @@ plugin_json() {
   # instead of naming the plugin's id.
   bins=$(find "$dir/bin" -maxdepth 1 -type f -perm -u+x -printf '%f\n' 2>/dev/null | jq -R . | jq -cs .)
 
-  jq -cn --arg id "$id" --arg dir "$dir" \
+  jq -cn --arg id "$id" --arg dir "$dir" --arg self "$SELF_ID" \
     --argjson valid "$valid" --arg validation "${validation#omarchy-plugin-validate: }" \
     --argjson m "$m" --argjson git "$(git_info "$dir")" --argjson bins "${bins:-[]}" '
     def str(v): if (v | type) == "string" then v else "" end;
     { id: $id,
+      self: ($id == $self),
       manifestId: str($m.id),
       name: (str($m.name) | if . == "" then $id else . end),
       version: str($m.version),
@@ -174,8 +220,11 @@ plugin_json() {
 # is not found.
 
 HYPR_DIR="$HOME/.config/hypr"
+BINDINGS="$HYPR_DIR/bindings.lua"
+BINDINGS_BACKUP="$HYPR_DIR/bindings.lua.plugin-manager.bak"
 MENU_DEFAULTS="${OMARCHY_PATH:-/usr/share/omarchy}/default/omarchy/omarchy-menu.jsonc"
 MENU_USER="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+BIND_MARK="bound by Plugin Manager"
 
 # [{keys, description, command, file, line}] for every o.bind line. A line
 # commented out does not start with o.bind, so it does not count.
@@ -190,6 +239,19 @@ config_binds_json() {
       | capture("^(?<file>[^:]+):(?<line>[0-9]+):\\s*o\\.bind\\(\\s*\"(?<keys>[^\"]*)\"\\s*,\\s*\"(?<description>[^\"]*)\"\\s*,\\s*\"(?<command>(\\\\.|[^\"\\\\])*)\"")
       | .line |= tonumber
       | .command |= gsub("\\\\(?<c>.)"; .c) ]'
+}
+
+# [{file, line, id}] for the comment line above every binding the manager made.
+bind_markers_json() {
+  local files=("$HYPR_DIR"/*.lua)
+  [[ -e ${files[0]} ]] || {
+    echo '[]'
+    return
+  }
+  grep -Hn -e "^-- .*, $BIND_MARK\$" "${files[@]}" 2>/dev/null | jq -Rsc --arg mark "$BIND_MARK" '
+    [ split("\n")[]
+      | capture("^(?<file>[^:]+):(?<line>[0-9]+):-- .*\\((?<id>[^()]+)\\), " + $mark + "$")
+      | .line |= tonumber ]'
 }
 
 # Hyprland's live bindings, or null when it cannot be asked.
@@ -231,15 +293,10 @@ cmd_list() {
   done < <(managed_ids)
 
   printf '%s\n' "${items[@]}" | jq -cs --argjson shell "$shell_plugins" --argjson cache "$cache" \
-    --argjson binds "$(config_binds_json)" --argjson live "$(live_binds_json)" \
-    --argjson menu "$(menu_entries_json)" --argjson config "$config" --arg braces "'{}'" '
+    --argjson binds "$(config_binds_json)" --argjson markers "$(bind_markers_json)" \
+    --argjson live "$(live_binds_json)" --argjson menu "$(menu_entries_json)" \
+    --argjson config "$config" --arg braces "'{}'" "$JQ_KEYS"'
     def eid: if type == "object" then (.id // "") else tostring end;
-    # "SUPER + SHIFT + L" in the shape hyprctl reports: a modifier mask and a key.
-    def combo:
-      {"SUPER": 64, "MOD": 64, "WIN": 64, "LOGO": 64, "SHIFT": 1, "CTRL": 4, "CONTROL": 4, "ALT": 8, "MOD1": 8} as $mods
-      | [split("+")[] | gsub("^\\s+|\\s+$"; "") | ascii_upcase | select(. != "")] as $parts
-      | { modmask: ([$parts[] | $mods[.] // empty] | add // 0),
-          key: ([$parts[] | select($mods[.] == null)] | last // "") };
     def esc: gsub("(?<c>[.*+?^$()\\[\\]{}|\\\\])"; "\\\(.c)");
     # A command belongs to a plugin when it names its id or runs one of its scripts.
     def mentions($p):
@@ -261,7 +318,10 @@ cmd_list() {
             | (.keys | combo) as $c
             | . + {active: (if $live == null then null
                             else any($live[]; .modmask == $c.modmask and (.key | ascii_upcase) == $c.key
-                                              and .description == $b.description) end)} ] as $shortcuts
+                                              and .description == $b.description) end),
+                   # The manager made it when its comment sits just above.
+                   managed: any($markers[]; .id == $p.id and .file == $b.file
+                                            and ($b.line - .line) >= 1 and ($b.line - .line) <= 2)} ] as $shortcuts
         | [ $menu | to_entries[]
             | select((.value.action | type) == "string" and (.value.action | mentions($p)))
             | {path: menupath(.key), action: .value.action} ] as $entries
@@ -316,14 +376,50 @@ check_one() {
      remoteVersion: $version, error: $err, checkedAt: $now}'
 }
 
+# Tell the desktop about plugins that have an update now and did not at the
+# last notification, so a plugin is announced once per update, not per check.
+notify_updates() {
+  local state id names=() body count
+  state=$(read_cache | jq -c '
+    [(.plugins // {}) | to_entries[] | select((.value.error // "") == "" and (.value.behind // 0) > 0) | .key] as $now
+    | {now: $now, new: ($now - (.notified // []))}')
+  update_cache --argjson now "$(jq -c '.now' <<<"$state")" '.notified = $now'
+
+  while IFS= read -r id; do
+    [[ -n $id ]] && names+=("$(plugin_name "$id")")
+  done < <(jq -r '.new[]' <<<"$state")
+  count=${#names[@]}
+  ((count > 0)) || return 0
+
+  if ((count == 1)); then
+    body="${names[0]} has an update"
+  elif ((count == 2)); then
+    body="${names[0]} and ${names[1]} have updates"
+  else
+    body="${names[0]}, ${names[1]} and $((count - 2)) more have updates"
+  fi
+
+  # Clicking it opens the manager.
+  if command -v omarchy-notification-send >/dev/null; then
+    omarchy-notification-send -g "$PLUGIN_GLYPH" -u normal "Plugin updates" "$body" \
+      --exec omarchy-shell shell summon "$SELF_ID" '{}' >/dev/null 2>&1 || true
+  elif command -v notify-send >/dev/null; then
+    notify-send -a "Plugin Manager" "Plugin updates" "$body" >/dev/null 2>&1 || true
+  fi
+}
+
 cmd_check() {
-  local only="" stale="" id at
+  local only="" stale="" notify=0 id at
   while (($# > 0)); do
     case "$1" in
     --if-stale)
       stale="${2:-}"
       [[ $stale =~ ^[0-9]+$ ]] || fail "--if-stale needs a number of seconds"
       shift 2
+      ;;
+    --notify)
+      notify=1
+      shift
       ;;
     -*) fail "unknown check option: $1" ;;
     *)
@@ -335,9 +431,9 @@ cmd_check() {
   done
   [[ -z $only ]] || require_managed "$only"
 
-  # One check at a time. The check opening the manager starts and one asked
-  # for by hand can overlap; the second waits here and then finds the cache
-  # fresh.
+  # One check at a time. A bar widget on every monitor fires its timer at
+  # once, and the manager checks when it opens; the second one waits here and
+  # then finds the cache fresh.
   mkdir -p "$CACHE_DIR"
   exec 8>"$CACHE_DIR/check.lock"
   flock 8
@@ -372,8 +468,47 @@ cmd_check() {
   else
     # A full check replaces the list, which drops plugins removed since.
     update_cache --argjson e "$entries" --arg now "$(date -Iseconds)" '.plugins = $e | .checkedAt = $now'
+    ((notify)) && notify_updates
   fi
   read_cache | jq -c '{ok: true} + .'
+}
+
+# review <id> -- what an update would bring in, fetched fresh: the commits, the
+# files it changes and the diff itself, cut off after MAX_DIFF_LINES lines.
+cmd_review() {
+  local id="${1:-}" dir entry err behind name files total tmp message
+  require_managed "$id"
+  dir="$PLUGINS_DIR/$id"
+  name=$(plugin_name "$id")
+
+  entry=$(check_one "$id")
+  update_cache --arg id "$id" --argjson e "$entry" '.plugins[$id] = $e'
+  err=$(jq -r '.error' <<<"$entry")
+  [[ -z $err ]] || fail "Could not check $name: $err"
+  behind=$(jq -r '.behind' <<<"$entry")
+
+  tmp=$(mktemp)
+  if ((behind > 0)); then
+    files=$(git -C "$dir" diff --numstat HEAD FETCH_HEAD 2>/dev/null | jq -Rsc '
+      [ split("\n")[] | select(length > 0) | split("\t")
+        | {path: .[2], added: ((.[0] | tonumber?) // null), deleted: ((.[1] | tonumber?) // null)} ]')
+    total=$(git -C "$dir" diff --no-color HEAD FETCH_HEAD 2>/dev/null | wc -l)
+    git -C "$dir" diff --no-color HEAD FETCH_HEAD 2>/dev/null | head -n "$MAX_DIFF_LINES" >"$tmp"
+    message="$(plural "$behind" "new commit"), $(plural "$(jq 'length' <<<"$files")" "file") changed"
+  else
+    files='[]'
+    total=0
+    message="$name is up to date"
+  fi
+
+  # Built here rather than through reply: a diff is too long to pass as an
+  # argument, so it is read from the file.
+  jq -cn --arg id "$id" --arg name "$name" --arg message "$message" --argjson entry "$entry" \
+    --argjson files "${files:-[]}" --argjson total "${total:-0}" --argjson max "$MAX_DIFF_LINES" \
+    --rawfile diff "$tmp" '
+    {ok: true, message: $message, output: "", id: $id, name: $name, entry: $entry,
+     files: $files, diff: $diff, totalLines: $total, truncated: ($total > $max)}'
+  rm -f "$tmp"
 }
 
 # ---------------------------------------------------------------- actions
@@ -400,6 +535,7 @@ cmd_update() {
 cmd_remove() {
   local id="${1:-}"
   require_managed "$id"
+  refuse_self "$id" remove
   run_stock "" "$id" omarchy-plugin-remove "$id" --yes || return 1
   update_cache --arg id "$id" 'del(.plugins[$id])'
 }
@@ -422,20 +558,198 @@ cmd_add() {
 cmd_enable() {
   local id="${1:-}"
   require_managed "$id"
+  refuse_self "$id" "switch on"
   run_stock "" "$id" omarchy-plugin-enable "$id"
 }
 
 cmd_disable() {
   local id="${1:-}"
   require_managed "$id"
+  refuse_self "$id" "switch off"
   run_stock "" "$id" omarchy-plugin-disable "$id"
+}
+
+# -------------------------------------------------------------- shortcuts
+
+# A binding the manager makes is a block in ~/.config/hypr/bindings.lua:
+#
+#   -- Default Applications (io.github.kimm-stensborg.default-apps), bound by Plugin Manager
+#   o.bind("SUPER + ALT + D", "Default Applications", "omarchy-shell shell toggle …")
+#
+# with an hl.unbind line between the two when it took over a combination
+# something else had. The comment is how it finds its own blocks again; it
+# never edits a binding it did not make.
+
+# The keys of the binding the manager made for a plugin, if it made one.
+own_bind_keys() {
+  jq -rn --argjson binds "$(config_binds_json)" --argjson markers "$(bind_markers_json)" --arg id "$1" "$JQ_KEYS"'
+    [ $markers[] | select(.id == $id) as $m
+      | $binds[] | select(.file == $m.file and (.line - $m.line) >= 1 and (.line - $m.line) <= 2)
+      | .keys | combo | keylabel ] | .[0] // ""'
+}
+
+# keycheck <keys> [id] -- the one spelling of a combination, and what Hyprland
+# already has on it. The binding the manager made for <id> does not count
+# against it: moving a shortcut onto itself is no conflict.
+cmd_keycheck() {
+  local keys="${1:-}" id="${2:-}" own=""
+  [[ -n $id ]] && own=$(own_bind_keys "$id")
+  jq -cn --arg keys "$keys" --argjson live "$(live_binds_json)" --arg own "$own" "$JQ_KEYS"'
+    ($keys | combo) as $c
+    | if $c.modmask == 0 or ($c.single | not) then
+        {ok: false, message: "Use one or more modifiers and one key, like SUPER + ALT + D"}
+      else
+        ($c | keylabel) as $label
+        | (takenby($live; $c) | .[0]) as $hit
+        | {ok: true, keys: $label, known: ($live != null),
+           taken: ($hit != null and $label != $own),
+           takenBy: (if $hit != null and $label != $own then ($hit.description // "") else "" end)}
+      end'
+}
+
+# suggest-key <id> -- the first free combination made from the plugin's name:
+# its initials first, then its other letters, each tried with the modifiers
+# Omarchy leaves mostly free.
+cmd_suggest_key() {
+  local id="${1:-}"
+  require_managed "$id"
+  jq -cn --arg name "$(plugin_name "$id")" --argjson live "$(live_binds_json)" \
+    --arg own "$(own_bind_keys "$id")" "$JQ_KEYS"'
+    ($name | ascii_upcase | [scan("[A-Z0-9]+")]) as $words
+    | ([$words[] | .[0:1]] + [$words[] | explode[] | [.] | implode]
+       | reduce .[] as $l ([]; if index($l) == null then . + [$l] else . end)) as $letters
+    | [ $letters[] as $l
+        | ("SUPER + ALT", "SUPER + CTRL", "SUPER + CTRL + SHIFT", "SUPER + SHIFT + ALT")
+        | ("\(.) + \($l)" | combo) as $c
+        | ($c | keylabel) as $label
+        | select((takenby($live; $c) | length) == 0 or $label == $own)
+        | $label ] as $free
+    | if ($free | length) > 0 then {ok: true, keys: $free[0]}
+      else {ok: false, message: "None of the usual combinations is free; type one"} end'
+}
+
+# The file without the manager's block for <id>; exits 3 when there was none.
+strip_bind_block() {
+  awk -v id="$1" -v mark="$BIND_MARK" '
+    index($0, "-- ") == 1 && index($0, "(" id "), " mark) > 0 && substr($0, length($0) - length(mark) + 1) == mark {
+      skip = 1; found = 1; next
+    }
+    skip && ($0 ~ /^hl\.unbind\(/ || $0 ~ /^o\.bind\(/) { next }
+    { skip = 0; lines[++n] = $0 }
+    END {
+      while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+      for (i = 1; i <= n; i++) print lines[i]
+      exit(found ? 0 : 3)
+    }' "$2"
+}
+
+lua_string() {
+  sed 's/\\/\\\\/g; s/"/\\"/g' <<<"$1"
+}
+
+# Reload Hyprland and keep the change only if it takes it without complaint;
+# otherwise put the file back as it was and print what Hyprland said.
+apply_hypr_config() {
+  local errors
+  hyprctl reload >/dev/null 2>&1
+  errors=$(hyprctl configerrors 2>/dev/null)
+  if [[ -n ${errors//[[:space:]]/} && $errors != "no errors"* ]]; then
+    cat "$BINDINGS_BACKUP" >"$BINDINGS"
+    hyprctl reload >/dev/null 2>&1
+    printf '%s\n' "$errors"
+    return 1
+  fi
+}
+
+# write_binding <id> <name> <keys> <command> <unbind-first>
+write_binding() {
+  local id="$1" name="${2//$'\n'/ }" keys="$3" command="$4" unbind="$5" tmp
+  mkdir -p "$HYPR_DIR"
+  touch "$BINDINGS"
+  cp "$BINDINGS" "$BINDINGS_BACKUP"
+  tmp=$(mktemp)
+  strip_bind_block "$id" "$BINDINGS" >"$tmp"
+  {
+    printf '\n-- %s (%s), %s\n' "$name" "$id" "$BIND_MARK"
+    ((unbind)) && printf 'hl.unbind("%s")\n' "$keys"
+    printf 'o.bind("%s", "%s", "%s")\n' "$keys" "$(lua_string "$name")" "$(lua_string "$command")"
+  } >>"$tmp"
+  # Written in place, the way the rest of the config is edited.
+  cat "$tmp" >"$BINDINGS"
+  rm -f "$tmp"
+  apply_hypr_config
+}
+
+# bind <id> <keys> [--replace] -- bind a combination to what Open runs for the
+# plugin. A combination something else has is refused unless --replace, which
+# unbinds it first.
+cmd_bind() {
+  local id="" keys="" replace=0
+  while (($# > 0)); do
+    case "$1" in
+    --replace)
+      replace=1
+      shift
+      ;;
+    -*) fail "unknown bind option: $1" ;;
+    *)
+      if [[ -z $id ]]; then id="$1"; elif [[ -z $keys ]]; then keys="$1"; else fail "unexpected argument: $1"; fi
+      shift
+      ;;
+    esac
+  done
+  require_managed "$id"
+  [[ -n $keys ]] || fail "a key combination is required"
+
+  local plugin name command check label taken=0 errors
+  plugin=$(cmd_list | jq -c --arg id "$id" '.plugins[] | select(.id == $id)')
+  name=$(jq -r '.name' <<<"$plugin")
+  command=$(jq -r '.openCommand' <<<"$plugin")
+  [[ -n $command ]] || fail "$name has no window to open, so there is nothing to bind"
+
+  check=$(cmd_keycheck "$keys" "$id")
+  jq -e '.ok' >/dev/null <<<"$check" || {
+    printf '%s\n' "$check"
+    return 1
+  }
+  label=$(jq -r '.keys' <<<"$check")
+  jq -e '.taken' >/dev/null <<<"$check" && taken=1
+  if ((taken && !replace)); then
+    reply false "$label is taken by $(jq -r '.takenBy | if . == "" then "another binding" else . end' <<<"$check")" "" \
+      "$(jq -c '{keys, taken, takenBy}' <<<"$check")"
+    return 1
+  fi
+
+  if ! errors=$(write_binding "$id" "$name" "$label" "$command" "$taken"); then
+    reply false "Hyprland rejected the binding, so it was not kept: $(last_line "$errors")" "$errors"
+    return 1
+  fi
+  reply true "Bound $label to $name" "" "$(jq -cn --arg id "$id" --arg keys "$label" '{id: $id, keys: $keys}')"
+}
+
+cmd_unbind() {
+  local id="${1:-}" tmp name
+  [[ -n $id ]] && valid_id "$id" || fail "a plugin id is required"
+  name=$(plugin_name "$id")
+  [[ -f $BINDINGS ]] || fail "there is no shortcut the manager made for $name"
+  cp "$BINDINGS" "$BINDINGS_BACKUP"
+  tmp=$(mktemp)
+  if ! strip_bind_block "$id" "$BINDINGS" >"$tmp"; then
+    rm -f "$tmp"
+    fail "there is no shortcut the manager made for $name"
+  fi
+  cat "$tmp" >"$BINDINGS"
+  rm -f "$tmp"
+  apply_hypr_config >/dev/null || fail "Hyprland rejected the change, so the shortcut was left as it was"
+  reply true "Removed the shortcut for $name" "" "$(jq -cn --arg id "$id" '{id: $id}')"
 }
 
 # ---------------------------------------------------------- export/import
 
 # The export is a list of git URLs, so it only carries what another machine can
 # clone: a git plugin whose remote is a path on this disk, or that has no
-# remote at all, is listed under "skipped" with the reason.
+# remote at all, is listed under "skipped" with the reason. The manager itself
+# is left out; the other machine needs it installed to import anything.
 #
 # Each plugin records whether it was enabled and where: every bar instance with
 # its section, index, neighbours and inline settings, the inline settings of a
@@ -470,6 +784,7 @@ cmd_export() {
 
     ($config.bar.layout // {}) as $layout
     | [ $list.plugins[]
+        | select(.self | not)
         | . as $p
         | ($p.git.remote // "") as $remote
         | if $remote == "" then skip($p; "it has no remote to fetch it from")
@@ -697,6 +1012,11 @@ cmd_import() {
 # so the overlay starts this detached and forgets it. While it works,
 # running.json says what is going on; when it is done the reply lands in
 # last-action.json and the overlay is summoned back to show it.
+#
+# Kind self-update is the manager updating itself. The running shell keeps the
+# QML it compiled until it restarts, so after a successful update the shell is
+# restarted -- which stops only the quickshell processes, not this job -- and
+# the manager summoned back into the new one.
 cmd_run() {
   local label="" id="" kind="" seq out
   while (($# > 0)); do
@@ -727,7 +1047,12 @@ cmd_run() {
     mv "$CACHE_DIR/last-action.json.tmp" "$CACHE_DIR/last-action.json"
   rm -f "$CACHE_DIR/running.json"
 
-  [[ -n ${PLUGIN_MANAGER_NO_SUMMON:-} ]] || resummon "$(jq -cn --arg seq "$seq" '{resume: $seq}')"
+  if [[ -z ${PLUGIN_MANAGER_NO_SUMMON:-} ]]; then
+    if [[ $kind == self-update ]] && jq -e '.ok and (.message | startswith("Updated"))' >/dev/null 2>&1 <<<"$out"; then
+      omarchy-restart-shell >/dev/null 2>&1 || true
+    fi
+    resummon "$(jq -cn --arg seq "$seq" '{resume: $seq}')"
+  fi
   printf '%s\n' "$out"
 }
 
@@ -769,11 +1094,16 @@ command="${1:-}"
 case "$command" in
 list) cmd_list ;;
 check) cmd_check "$@" ;;
+review) cmd_review "$@" ;;
 update) cmd_update "$@" ;;
 remove) cmd_remove "$@" ;;
 add) cmd_add "$@" ;;
 enable) cmd_enable "$@" ;;
 disable) cmd_disable "$@" ;;
+suggest-key) cmd_suggest_key "$@" ;;
+keycheck) cmd_keycheck "$@" ;;
+bind) cmd_bind "$@" ;;
+unbind) cmd_unbind "$@" ;;
 export) cmd_export "$@" ;;
 import) cmd_import "$@" ;;
 run) cmd_run "$@" ;;
