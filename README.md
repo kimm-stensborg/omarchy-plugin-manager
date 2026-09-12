@@ -1,17 +1,23 @@
 # Plugin Manager
 
-One place to see and look after the Omarchy shell plugins you have installed:
+One place to look after the Omarchy shell plugins you installed from git:
 list them, read their details, see which have updates waiting, update, enable,
-disable, remove, and add new ones from a git URL.
+disable, remove, add new ones from a git URL, and carry the whole set to
+another Omarchy install with an export file.
 
 - **Plugin ID:** `io.github.kimm-stensborg.plugin-manager`
 - **Kinds:** `overlay`, `bar-widget`
 - **License:** MIT
 - **Requires:** Omarchy 4 (Quattro) with `omarchy-shell`; `git`, `jq`
 
-It manages what lives in `~/.config/omarchy/plugins/` — third-party plugins and
-your clones of built-ins. The built-in `omarchy.*` plugins are left out, since
-they can be neither updated nor removed, and so is the manager itself.
+It manages **git plugins only**: the checkouts `omarchy plugin add` makes in
+`~/.config/omarchy/plugins/`. Everything else is left alone, and so is the
+manager itself:
+
+- the built-in `omarchy.*` plugins
+- clones of built-ins
+- folders dropped in by hand
+- symlinks to working copies
 
 ## Install
 
@@ -53,21 +59,19 @@ omarchy-shell shell toggle io.github.kimm-stensborg.plugin-manager '{}'
 | `u` | update the selected plugin |
 | `e` | enable or disable it |
 | `d` / `Del` | remove it (asks first) |
-| `a` / `/` | type a git URL to add; `⏎` adds, `Esc` leaves the field |
+| `a` / `/` | type a git URL to add, or an export file to import; `⏎` goes, `Esc` leaves the field |
+| `x` | export your plugins to a file |
 | `o` | open its repository in the browser |
 | `r` | reload the list |
 | `Esc` | close |
 
 ## What it shows
 
-For every plugin: name, version, description, author, license, kinds, whether
-it is enabled, and where it came from.
+For every plugin:
 
-- **git**: the remote, branch, commit and last commit. This is what
-  `omarchy plugin add` produces.
-- **local**: dropped in by hand.
-- **clone**: made with `omarchy plugin clone`.
-- **symlink**: a link to a working copy elsewhere, handy while developing.
+- name, version, description, author, license and kinds
+- whether it is enabled
+- its remote, branch, commit and last commit
 
 Problems are called out: a manifest the validator rejects, local changes that
 would stop an update from fast-forwarding, and a checkout that has diverged
@@ -77,8 +81,7 @@ from upstream.
 
 A check does the same fetch as `omarchy plugin update`, so "3 new commits"
 means exactly what an update would bring in. The commits are listed, along
-with the version the upstream manifest declares. Only git checkouts can be
-checked, since nothing else has an upstream.
+with the version the upstream manifest declares.
 
 The results are cached in `~/.cache/omarchy/plugin-manager/updates.json`. The
 bar button checks at startup and every six hours after that, and opening the
@@ -91,6 +94,37 @@ Paste a git URL and press `⏎`. The plugin is cloned and validated by
 `omarchy plugin add`, and it lands **disabled**. Plugins run unsandboxed
 inside `omarchy-shell`, so read the code before you switch it on with `e`.
 
+## Export and import
+
+`x` writes every plugin to `~/omarchy-plugins-<host>-<date>.json`. Copy that
+file to the other machine, install the Plugin Manager there, type the file's
+path into the add field and press `⏎`. A preview lists what will be installed
+and what is skipped, and nothing happens until you confirm it.
+
+For each plugin the file records:
+
+- its git URL and the commit it was at
+- whether it was enabled
+- where it sat: its section in the bar and its neighbours, or whether it was
+  the bar itself
+- its inline settings from `shell.json`
+
+The import clones the **latest** version of each plugin. Plugins that were
+enabled are switched on again in the same section, next to the same widget
+when the other bar has it, and with the same settings.
+
+A plugin whose remote another machine cannot fetch from is not included, and
+the preview says why: one with no remote, or one whose remote is a path on
+this disk. Plugins that are already installed are left as they are.
+
+From a terminal:
+
+```bash
+bin/plugin-manager export [file]
+bin/plugin-manager import <file> --dry-run   # what it would do
+bin/plugin-manager import <file>
+```
+
 ## How it works
 
 | Path | What |
@@ -102,9 +136,9 @@ inside `omarchy-shell`, so read the code before you switch it on with `e`.
 | `test.sh` | backend tests |
 
 The backend prints one JSON document per command (`list`, `check`, `update`,
-`remove`, `add`, `enable`, `disable`). The actions wrap the stock
-`omarchy-plugin-*` commands, so cloning, validation, rollback and rescans work
-exactly as they do from the terminal.
+`remove`, `add`, `enable`, `disable`, `export`, `import`). The actions wrap
+the stock `omarchy-plugin-*` commands, so cloning, validation, rollback and
+rescans work exactly as they do from the terminal.
 
 Those commands finish by rescanning the shell, and a rescan unloads every open
 panel, this one included. So the overlay does not wait on them. It starts
@@ -113,6 +147,8 @@ panel, this one included. So the overlay does not wait on them. It starts
 1. writes `running.json` while it works,
 2. writes the reply to `last-action.json`,
 3. summons the manager back, which shows the result.
+
+Checks, exports and import previews do not rescan, so they run directly.
 
 ## Remove
 
@@ -146,9 +182,6 @@ of its functions, for example `toggleEnabled` or `checkAll`.
 ```
 
 The tests run the backend against a throwaway `$HOME`, using fake plugins and
-local bare repositories as their upstreams. No real plugin is touched.
-
-## Roadmap
-
-- Export your plugins (URLs, commits, enabled state and bar placement) to a
-  file, and import it on another Omarchy install.
+local bare repositories as their upstreams. A stand-in `omarchy-shell` first on
+`PATH` answers in place of the running shell, so no test touches your real
+plugins or `shell.json`.

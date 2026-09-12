@@ -12,10 +12,14 @@
 #   plugin-manager add <git-url>
 #   plugin-manager enable <id>
 #   plugin-manager disable <id>
+#   plugin-manager export [file]
+#   plugin-manager import <file> [--dry-run]
 #   plugin-manager run --label L --id ID --kind K -- <command...>
 #
-# Only plugins under ~/.config/omarchy/plugins are managed -- built-in omarchy.*
-# plugins can be neither updated nor removed -- and never the manager itself.
+# Only git plugins are managed: the checkouts `omarchy plugin add` makes in
+# ~/.config/omarchy/plugins. Clones of built-ins, folders dropped in by hand
+# and symlinks are left alone, as are the built-in omarchy.* plugins -- and so
+# is the manager itself.
 
 set -uo pipefail
 
@@ -55,23 +59,31 @@ valid_id() {
   [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != *..* ]]
 }
 
-# An installed plugin the manager may act on: anything in the plugin directory
-# except the manager itself.
+# A real folder holding a git checkout. A symlink is a working copy that lives
+# somewhere else, even when the folder it points to is a checkout.
+is_git_plugin() {
+  [[ -d $PLUGINS_DIR/$1/.git && ! -L $PLUGINS_DIR/$1 ]]
+}
+
+# A plugin the manager may act on: a git plugin other than the manager itself.
 require_managed() {
   local id="$1"
   [[ -n $id ]] || fail "a plugin id is required"
   valid_id "$id" || fail "invalid plugin id '$id'"
   [[ $id != "$SELF_ID" ]] || fail "the plugin manager does not manage itself"
   [[ -e $PLUGINS_DIR/$id || -L $PLUGINS_DIR/$id ]] || fail "plugin '$id' is not installed"
+  is_git_plugin "$id" || fail "'$id' is not a git plugin, and git plugins are all the manager handles"
 }
 
 # Folder names, which are what omarchy-plugin-update and -remove take. Dot
 # folders are the add/remove staging and backup directories.
 managed_ids() {
   [[ -d $PLUGINS_DIR ]] || return 0
-  find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) ! -name '.*' -printf '%f\n' |
-    { grep -vxF "$SELF_ID" || true; } |
-    sort
+  local id
+  while IFS= read -r id; do
+    [[ $id != "$SELF_ID" ]] && is_git_plugin "$id" && printf '%s\n' "$id"
+  done < <(find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' | sort)
+  return 0
 }
 
 # ------------------------------------------------------------------ cache
@@ -106,10 +118,6 @@ update_cache() {
 
 git_info() {
   local dir="$1" remote branch line dirty=false
-  [[ -d $dir/.git ]] || {
-    echo null
-    return
-  }
   remote=$(git -C "$dir" remote get-url origin 2>/dev/null)
   branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
   line=$(git -C "$dir" log -1 --format='%h%x1f%H%x1f%cI%x1f%s' 2>/dev/null)
@@ -125,28 +133,15 @@ plugin_json() {
   local id="$1"
   local dir="$PLUGINS_DIR/$1"
   local manifest="$dir/manifest.json"
-  local source validation valid=true link="" m='{}'
+  local validation valid=true m='{}'
 
-  if [[ -L $dir ]]; then
-    source=symlink
-    link=$(readlink -f "$dir")
-  elif [[ -d $dir/.git ]]; then
-    source=git
-  elif [[ -f $manifest ]] && jq -e '.omarchy.clonedFrom // empty' "$manifest" >/dev/null 2>&1; then
-    source=clone
-  else
-    source=local
-  fi
-
-  # The trailing slash makes the validator's `find -type l` look inside a
-  # symlinked plugin instead of reporting the link it was handed.
-  validation=$(omarchy-plugin-validate "$dir/" 2>&1) || valid=false
+  validation=$(omarchy-plugin-validate "$dir" 2>&1) || valid=false
   if [[ -f $manifest ]]; then
     m=$(jq -c 'if type == "object" then . else {} end' "$manifest" 2>/dev/null) || m='{}'
     [[ -n $m ]] || m='{}'
   fi
 
-  jq -cn --arg id "$id" --arg dir "$dir" --arg source "$source" --arg link "$link" \
+  jq -cn --arg id "$id" --arg dir "$dir" \
     --argjson valid "$valid" --arg validation "${validation#omarchy-plugin-validate: }" \
     --argjson m "$m" --argjson git "$(git_info "$dir")" '
     def str(v): if (v | type) == "string" then v else "" end;
@@ -158,10 +153,7 @@ plugin_json() {
       license: str($m.license),
       description: str($m.description),
       kinds: (if ($m.kinds | type) == "array" then $m.kinds else [] end),
-      clonedFrom: str($m.omarchy.clonedFrom?),
       path: $dir,
-      linkTarget: $link,
-      source: $source,
       valid: $valid,
       validationError: (if $valid then "" else $validation end),
       git: $git }'
@@ -199,12 +191,6 @@ check_one() {
   local now err="" behind=0 ahead=0 commits='[]' version=""
   now=$(date -Iseconds)
 
-  if [[ ! -d $dir/.git ]]; then
-    jq -cn --arg now "$now" \
-      '{checkable: false, behind: 0, ahead: 0, commits: [], remoteVersion: "", error: "", checkedAt: $now}'
-    return
-  fi
-
   # The same fetch omarchy-plugin-update does, so "behind" here means exactly
   # what an update would bring in.
   if ((fetch)) && ! err=$(git -C "$dir" fetch --quiet origin HEAD 2>&1); then
@@ -225,7 +211,7 @@ check_one() {
 
   jq -cn --arg now "$now" --arg err "$err" --argjson behind "${behind:-0}" --argjson ahead "${ahead:-0}" \
     --argjson commits "${commits:-[]}" --arg version "$version" '
-    {checkable: true, behind: $behind, ahead: $ahead, commits: $commits,
+    {behind: $behind, ahead: $ahead, commits: $commits,
      remoteVersion: $version, error: $err, checkedAt: $now}'
 }
 
@@ -305,7 +291,6 @@ run_stock() {
 cmd_update() {
   local id="${1:-}"
   require_managed "$id"
-  [[ -d $PLUGINS_DIR/$id/.git ]] || fail "'$id' is not a git checkout, so there is nothing to update from"
   run_stock "" "$id" omarchy-plugin-update "$id" --yes || return 1
   update_cache --arg id "$id" --argjson e "$(check_one "$id" 0)" '.plugins[$id] = $e'
 }
@@ -342,6 +327,263 @@ cmd_disable() {
   local id="${1:-}"
   require_managed "$id"
   run_stock "" "$id" omarchy-plugin-disable "$id"
+}
+
+# ---------------------------------------------------------- export/import
+
+# The export is a list of git URLs, so it only carries what another machine can
+# clone: a git plugin whose remote is a path on this disk, or that has no
+# remote at all, is listed under "skipped" with the reason.
+#
+# Each plugin records whether it was enabled and where: every bar instance with
+# its section, index, neighbours and inline settings, the inline settings of a
+# plugins[] entry, or whether it was the bar itself.
+
+EXPORT_FORMAT="omarchy-plugin-manager"
+
+cmd_export() {
+  local file="${1:-}" listing config out count skipped
+  [[ -n $file ]] || file="$HOME/omarchy-plugins-$(uname -n)-$(date +%Y%m%d).json"
+  file="${file/#\~/$HOME}"
+
+  listing=$(cmd_list) || fail "could not list the plugins"
+  config=$(jq -c 'if type == "object" then . else {} end' "$HOME/.config/omarchy/shell.json" 2>/dev/null)
+  [[ -n $config ]] || config='{}'
+
+  out=$(jq -n --argjson list "$listing" --argjson config "$config" --arg format "$EXPORT_FORMAT" \
+    --arg now "$(date -Iseconds)" --arg host "$(uname -n)" --arg omarchy "$(omarchy version 2>/dev/null | head -n 1)" '
+    def eid: if type == "object" then (.id // "") else tostring end;
+    def portable: test("^(https?|ssh|git)://.") or test("^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:.");
+    def placements($layout; $id):
+      [ ("left", "center", "right") as $section
+        | ($layout[$section] // []) as $entries
+        | range(0; $entries | length) as $i
+        | select(($entries[$i] | eid) == $id)
+        | { section: $section,
+            index: $i,
+            after: (if $i > 0 then ($entries[$i - 1] | eid) else null end),
+            before: (if $i + 1 < ($entries | length) then ($entries[$i + 1] | eid) else null end),
+            settings: ($entries[$i] | if type == "object" then del(.id) else {} end) } ];
+    def skip($p; $reason): {skip: {id: $p.id, name: $p.name, reason: $reason}};
+
+    ($config.bar.layout // {}) as $layout
+    | [ $list.plugins[]
+        | . as $p
+        | ($p.git.remote // "") as $remote
+        | if $remote == "" then skip($p; "it has no remote to fetch it from")
+          elif ($remote | portable | not) then skip($p; "its remote is a path on this machine")
+          else
+            { plugin: {
+                id: $p.id, name: $p.name, version: $p.version, url: $remote,
+                branch: $p.git.branch, commit: $p.git.fullCommit, enabled: $p.enabled,
+                bar: ((($config.bar.id // "") | tostring) == $p.id),
+                placements: placements($layout; $p.id),
+                settings: (([($config.plugins // [])[] | select(type == "object" and .id == $p.id) | del(.id)] | .[0]) // {}) } }
+          end ]
+    | { format: $format, version: 1, exportedAt: $now, host: $host, omarchyVersion: $omarchy,
+        plugins: [.[] | .plugin // empty],
+        skipped: [.[] | .skip // empty] }') || fail "could not build the export"
+
+  mkdir -p "$(dirname "$file")" || fail "cannot create $(dirname "$file")"
+  printf '%s\n' "$out" | jq . >"$file" || fail "cannot write $file"
+
+  count=$(jq '.plugins | length' <<<"$out")
+  skipped=$(jq '.skipped | length' <<<"$out")
+  local message="Exported $count plugin$( ((count == 1)) || echo s) to ${file/#$HOME/\~}"
+  ((skipped == 0)) || message+=" · $skipped skipped"
+  reply true "$message" "" "$(jq -c --arg path "$file" '{path: $path, exported: (.plugins | length), skipped: .skipped}' <<<"$out")"
+}
+
+# Every folder in the plugin directory, git or not and the manager included:
+# an import must not try to add what is already here under any name.
+installed_json() {
+  [[ -d $PLUGINS_DIR ]] || {
+    echo '[]'
+    return
+  }
+  find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) ! -name '.*' -printf '%f\n' | jq -R . | jq -cs .
+}
+
+# Wait for the shell to have scanned a freshly added plugin; enabling one it has
+# not seen yet is refused as unknown.
+wait_known() {
+  local id="$1" i
+  for ((i = 0; i < 50; i++)); do
+    omarchy-plugin-list --json 2>/dev/null | jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# A plugins[] entry's inline settings. The shell has no IPC for these, so they
+# go into shell.json directly -- written in place, like the shell's own writes
+# -- and the shell is asked to read it again. Enabling has already added the
+# entry; should it be missing, it is added here rather than lost.
+apply_entry_settings() {
+  local id="$1" settings="$2" config="$HOME/.config/omarchy/shell.json" tmp
+  [[ -f $config ]] || return 1
+  tmp=$(mktemp)
+  if jq --arg id "$id" --argjson s "$settings" '
+    .plugins = ((.plugins // [])
+      | if any(.[]; type == "object" and .id == $id)
+        then map(if type == "object" and .id == $id then ({id: $id} + $s) else . end)
+        else . + [{id: $id} + $s] end)' "$config" >"$tmp"; then
+    cat "$tmp" >"$config"
+  fi
+  rm -f "$tmp"
+  omarchy-shell shell reloadConfig >/dev/null 2>&1
+}
+
+# restore_enabled <id> <exported-plugin-json> -- switch a just-added plugin on
+# the way it was exported. Prints what it did; returns 1 with the reason.
+restore_enabled() {
+  local id="$1" entry="$2" placement result key value i
+  wait_known "$id" || {
+    echo "the shell did not pick it up"
+    return 1
+  }
+
+  if jq -e '.bar == true' >/dev/null <<<"$entry"; then
+    omarchy-plugin-enable "$id" >/dev/null 2>&1 || {
+      echo "could not make it the bar"
+      return 1
+    }
+    echo "enabled as the bar"
+    return 0
+  fi
+
+  if jq -e '(.placements // []) | length > 0' >/dev/null <<<"$entry"; then
+    # Next to the widget it sat beside, when this bar has that widget too;
+    # putBarWidget drops a neighbour it cannot find and keeps the section.
+    placement=$(jq -c '.placements[0] | {section}
+      + (if .after then {after} elif .before then {before} else {index} end)' <<<"$entry")
+    for ((i = 0; i < 40; i++)); do
+      result=$(omarchy-shell shell putBarWidget "$id" "$placement" 2>&1)
+      [[ $result == "not ready" ]] || break
+      sleep 0.1
+    done
+    [[ $result == ok ]] || {
+      echo "could not put it on the bar: $result"
+      return 1
+    }
+    while IFS=$'\t' read -r key value; do
+      [[ -n $key ]] || continue
+      omarchy-shell shell setBarWidget "$id" "$key" "$value" '{}' >/dev/null 2>&1
+    done < <(jq -r '.placements[0].settings // {} | to_entries[] | [.key, (.value | tojson)] | @tsv' <<<"$entry")
+    echo "enabled in the $(jq -r '.placements[0].section' <<<"$entry") section"
+    return 0
+  fi
+
+  omarchy-plugin-enable "$id" >/dev/null 2>&1 || {
+    echo "could not enable it"
+    return 1
+  }
+  if jq -e '(.settings // {}) | length > 0' >/dev/null <<<"$entry"; then
+    apply_entry_settings "$id" "$(jq -c '.settings' <<<"$entry")"
+  fi
+  echo "enabled"
+}
+
+cmd_import() {
+  local file="" dry=0 doc plan
+  while (($# > 0)); do
+    case "$1" in
+    --dry-run) dry=1; shift ;;
+    -*) fail "unknown import option: $1" ;;
+    *)
+      [[ -z $file ]] || fail "unexpected argument: $1"
+      file="$1"
+      shift
+      ;;
+    esac
+  done
+  [[ -n $file ]] || fail "an export file is required"
+  file="${file/#\~/$HOME}"
+  [[ -f $file ]] || fail "there is no file at ${file/#$HOME/\~}"
+  doc=$(jq -c --arg format "$EXPORT_FORMAT" 'select(type == "object" and .format == $format and .version == 1)' "$file" 2>/dev/null)
+  [[ -n $doc ]] || fail "${file/#$HOME/\~} is not a Plugin Manager export"
+
+  # What happens to each plugin. The file is data from elsewhere, so ids are
+  # checked here and URLs by omarchy-plugin-add before anything is cloned.
+  plan=$(jq -c --argjson installed "$(installed_json)" '
+    [ (.plugins // [])[]
+      | select(type == "object")
+      | (.id // "" | tostring) as $id
+      | { id: $id, name: (.name // $id), url: (.url // ""), enabled: (.enabled == true),
+          where: (if .bar == true then "as the bar"
+                  elif ((.placements // []) | length) > 0 then "in the \(.placements[0].section) section"
+                  else "" end),
+          entry: . }
+      | if ($id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$") | not) or ($id | contains("..")) then
+          . + {action: "skip", reason: "an invalid plugin id"}
+        elif ($installed | index($id)) != null then . + {action: "skip", reason: "already installed"}
+        elif .url == "" then . + {action: "skip", reason: "no URL to fetch it from"}
+        else . + {action: "install"} end ]' <<<"$doc")
+
+  local installing
+  installing=$(jq '[.[] | select(.action == "install")] | length' <<<"$plan")
+
+  if ((dry)); then
+    local message
+    message=$(jq -r '
+      ([.[] | select(.action == "install")] | length) as $n
+      | ([.[] | select(.action == "skip")] | length) as $s
+      | (if $n == 0 then "Nothing to import" else "\($n) plugin\(if $n == 1 then "" else "s" end) to import" end)
+        + (if $s > 0 then " · \($s) skipped" else "" end)' <<<"$plan")
+    reply true "$message" "" "$(jq -c --argjson plan "$plan" '{
+      host, exportedAt, path: $path,
+      plan: [$plan[] | del(.entry)],
+      skippedAtExport: (.skipped // [])}' --arg path "$file" <<<"$doc")"
+    return
+  fi
+
+  ((installing > 0)) || {
+    reply true "Nothing to import: every plugin in the file is already here or was skipped"
+    return
+  }
+
+  local item id url out added what ok_count=0 fail_count=0 lines=() failed=()
+  while IFS= read -r item; do
+    id=$(jq -r '.id' <<<"$item")
+    url=$(jq -r '.url' <<<"$item")
+    if ! out=$(omarchy-plugin-add "$url" --yes 2>&1 </dev/null); then
+      lines+=("✗ $id: $(last_line "$out")")
+      failed+=("$id: $(last_line "$out")")
+      fail_count=$((fail_count + 1))
+      continue
+    fi
+    added=$(sed -n 's/^Added \(.*\) into .*/\1/p' <<<"$out" | tail -n 1)
+    what="added"
+    if [[ -n $added && $added != "$id" ]]; then
+      what="added as $added (the repo has renamed it)"
+      id="$added"
+    fi
+    if jq -e '.enabled' >/dev/null <<<"$item"; then
+      if out=$(restore_enabled "$id" "$(jq -c '.entry' <<<"$item")"); then
+        what+=", $out"
+      else
+        what+=", but $out"
+      fi
+    fi
+    lines+=("✓ $id: $what")
+    ok_count=$((ok_count + 1))
+  done < <(jq -c '.[] | select(.action == "install")' <<<"$plan")
+
+  local message="Imported $ok_count of $installing plugin$( ((installing == 1)) || echo s)"
+  if ((fail_count > 0)); then
+    # The first failure goes in the message itself, since that is what the
+    # overlay's status line shows; every plugin's line is in the output.
+    message+=" · $fail_count failed: ${failed[0]}"
+    ((fail_count == 1)) || message+=" (and $((fail_count - 1)) more)"
+  fi
+  local output
+  output=$(printf '%s\n' "${lines[@]}")
+  if ((fail_count == 0)); then
+    reply true "$message" "$output"
+  else
+    reply false "$message" "$output"
+    return 1
+  fi
 }
 
 # -------------------------------------------------------------------- run
@@ -392,20 +634,27 @@ loaded() {
 }
 
 # Bring the manager back with a job's result. When the stock command returns,
-# the rescan it ended with is still going -- panels unload, the registry
-# rescans, and a new plugin folder sets off a second reload 150ms later -- and
-# a summon landing in the middle of that is lost with the old panels. So keep
-# summoning until the overlay answers and is still there a second later.
-# Summoning an overlay that survived only hands it the result again, which it
-# has already shown and ignores.
+# its reloads may not have happened yet: the rescan it ended with, and the one
+# the file watcher sets off 150ms after it sees a plugin folder come or go. An
+# overlay that answers now can still be torn down a moment later, so it only
+# counts once it has kept answering for three seconds; until then, whenever it
+# is gone, summon it again. An overlay that survives is left alone -- it polls
+# last-action.json and shows the result itself.
 resummon() {
-  local payload="$1" i
-  for ((i = 0; i < 20; i++)); do
-    omarchy-shell shell summon "$SELF_ID" "$payload" >/dev/null 2>&1
+  local payload="$1" i pause stable
+  for ((i = 0; i < 30; i++)); do
+    loaded || omarchy-shell shell summon "$SELF_ID" "$payload" >/dev/null 2>&1
     sleep 0.4
     loaded || continue
-    sleep 0.6
-    loaded && return 0
+    stable=1
+    for pause in 0.6 1 1.4; do
+      sleep "$pause"
+      loaded || {
+        stable=0
+        break
+      }
+    done
+    ((stable)) && return 0
   done
   return 1
 }
@@ -423,9 +672,12 @@ remove) cmd_remove "$@" ;;
 add) cmd_add "$@" ;;
 enable) cmd_enable "$@" ;;
 disable) cmd_disable "$@" ;;
+export) cmd_export "$@" ;;
+import) cmd_import "$@" ;;
 run) cmd_run "$@" ;;
 -h | --help | help)
-  sed -n '3,18p' "$0" | sed 's/^# \?//'
+  # The comment block at the top of this file, however long it grows.
+  awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"
   ;;
 *) fail "unknown command '${command}'; see --help" ;;
 esac

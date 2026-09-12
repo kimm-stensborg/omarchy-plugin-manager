@@ -38,10 +38,16 @@ Item {
   property bool listedOnce: false
   property bool relistPending: false
 
-  // An update check runs in-process: it never rescans the shell.
+  // Update checks, exports and import previews run in-process: none of them
+  // rescans the shell.
   property string busyLabel: ""
   property string busyId: ""
+  property string busyKind: ""
   property bool busyQuiet: false
+
+  // An import waiting on its confirmation: the dry run's reply.
+  property bool confirmingImport: false
+  property var importPreview: null
 
   // Everything else runs detached (see `plugin-manager run`), because the
   // stock commands end in a shell rescan that unloads this overlay mid-action.
@@ -180,18 +186,21 @@ Item {
   // One action at a time: they all end in the stock commands, which rescan
   // the shell and would trip over each other.
   function runAction(args, label, id, kind, quiet) {
-    if (root.busy || checkProc.running) {
+    if (root.busy || quickProc.running) {
       if (!quiet) root.setStatus("Still " + root.activityLabel.toLowerCase() + " …", false)
       return
     }
     if (!quiet) root.setStatus("", false)
 
-    if (kind === "check") {
+    // Checks, exports and import previews run in-process: none of them ends
+    // in a rescan, so nothing unloads the overlay under them.
+    if (kind === "check" || kind === "export" || kind === "preview") {
       root.busyLabel = label
       root.busyId = id || ""
+      root.busyKind = kind
       root.busyQuiet = quiet === true
-      checkProc.command = [root.backend].concat(args)
-      checkProc.running = true
+      quickProc.command = [root.backend].concat(args)
+      quickProc.running = true
       return
     }
 
@@ -203,17 +212,25 @@ Item {
                             .concat(args))
   }
 
-  function applyCheck(text) {
+  function applyQuick(text) {
     var id = root.busyId
+    var kind = root.busyKind
     var quiet = root.busyQuiet
+    var label = root.busyLabel
     root.busyLabel = ""
     root.busyId = ""
+    root.busyKind = ""
     var payload = root.parseJson(text)
     if (!payload || !payload.ok) {
-      root.setStatus(payload && payload.message ? payload.message : "The update check failed", true)
-    } else {
+      root.setStatus(payload && payload.message ? payload.message : label + " failed", true)
+    } else if (kind === "check") {
       var summary = root.checkSummary(payload, id)
       if (!quiet || summary.error) root.setStatus(summary.text, summary.error)
+    } else if (kind === "preview") {
+      root.showImportPreview(payload)
+      return
+    } else {
+      root.setStatus(payload.message, false)
     }
     root.refresh()
   }
@@ -282,7 +299,6 @@ Item {
       var name = root.nameOf(id)
       if (!entry) return { text: "", error: false }
       if (entry.error) return { text: "Could not check " + name + ": " + entry.error, error: true }
-      if (!entry.checkable) return { text: name + " is not a git checkout, so updates are not tracked", error: false }
       if (entry.behind > 0) return { text: name + ": " + root.commitsText(entry.behind) + " waiting", error: false }
       return { text: name + " is up to date", error: false }
     }
@@ -300,12 +316,7 @@ Item {
 
   function checkCurrent() {
     var p = root.current
-    if (!p) return
-    if (p.source !== "git") {
-      root.setStatus(p.name + " is not a git checkout, so updates are not tracked", false)
-      return
-    }
-    root.runAction(["check", p.id], "Checking " + p.name, p.id, "check", false)
+    if (p) root.runAction(["check", p.id], "Checking " + p.name, p.id, "check", false)
   }
 
   function checkAll() {
@@ -315,11 +326,7 @@ Item {
   function updateCurrent() {
     var p = root.current
     if (!p) return
-    if (p.source !== "git") {
-      root.setStatus(p.name + " is not a git checkout, so there is nothing to update from", true)
-      return
-    }
-    if (p.update && p.update.checkable && !p.update.error && p.update.behind === 0) {
+    if (p.update && !p.update.error && p.update.behind === 0) {
       root.setStatus(p.name + " is already up to date", false)
       return
     }
@@ -350,13 +357,74 @@ Item {
     keyCatcher.forceActiveFocus()
   }
 
+  // The field takes either: a .json file is an export to preview and import,
+  // anything else is a git URL (or a local repo path) to add.
   function addPlugin() {
-    var url = urlField.text.trim()
-    if (!url) {
+    var text = urlField.text.trim()
+    if (!text) {
       urlField.forceActiveFocus()
       return
     }
-    root.runAction(["add", url], "Adding " + url, "", "add", false)
+    if (/\.json$/i.test(text)) root.previewImport(text)
+    else root.runAction(["add", text], "Adding " + text, "", "add", false)
+    keyCatcher.forceActiveFocus()
+  }
+
+  // Read an export file and show what importing it would do. Also callable
+  // over IPC: `omarchy-shell shell call <id> previewImport <path>`.
+  function previewImport(path) {
+    var file = String(path || "").trim()
+    if (!file) return
+    root.runAction(["import", file, "--dry-run"], "Reading " + file, "", "preview", false)
+  }
+
+  function exportPlugins() {
+    root.runAction(["export"], "Exporting plugins", "", "export", false)
+  }
+
+  // A dry run came back: show what the import would do and let it be confirmed.
+  function showImportPreview(payload) {
+    var plan = payload.plan || []
+    var installs = 0
+    for (var i = 0; i < plan.length; i++) if (plan[i].action === "install") installs++
+    if (installs === 0) {
+      root.setStatus(payload.message + ": everything in the file is already here or was skipped", false)
+      return
+    }
+    root.importPreview = payload
+    confirm.selectedIndex = 0
+    root.confirmingImport = true
+  }
+
+  function importMessage() {
+    var p = root.importPreview
+    if (!p) return ""
+    var lines = ["Import from " + (p.host || "another machine")
+                 + (p.exportedAt ? ", exported " + String(p.exportedAt).slice(0, 10) : "") + "?", ""]
+    var plan = p.plan || []
+    for (var i = 0; i < plan.length; i++) {
+      var item = plan[i]
+      if (item.action === "install")
+        lines.push("+ " + item.name + (item.enabled ? "  (enabled" + (item.where ? ", " + item.where : "") + ")" : ""))
+    }
+    var skipped = []
+    for (var j = 0; j < plan.length; j++)
+      if (plan[j].action !== "install") skipped.push("· " + plan[j].name + ": " + plan[j].reason)
+    var atExport = p.skippedAtExport || []
+    for (var k = 0; k < atExport.length; k++)
+      skipped.push("· " + atExport[k].name + ": not in the file, " + atExport[k].reason)
+    if (skipped.length > 0) lines = lines.concat([""], skipped)
+    return lines.join("\n")
+  }
+
+  function importConfirmed() {
+    root.confirmingImport = false
+    var p = root.importPreview
+    root.importPreview = null
+    if (p && p.path) {
+      root.runAction(["import", p.path], "Importing plugins", "", "import", false)
+      urlField.text = ""
+    }
     keyCatcher.forceActiveFocus()
   }
 
@@ -393,7 +461,7 @@ Item {
   }
 
   function behind(p) {
-    return p && p.update && p.update.checkable && !p.update.error ? Number(p.update.behind || 0) : 0
+    return p && p.update && !p.update.error ? Number(p.update.behind || 0) : 0
   }
 
   function commitsText(n) { return n === 1 ? "1 new commit" : n + " new commits" }
@@ -409,12 +477,8 @@ Item {
     return Math.floor(s / 86400) + " d ago"
   }
 
-  function sourceLabel(p) {
-    if (!p) return ""
-    if (p.source === "symlink") return "symlink"
-    if (p.source === "clone") return "clone of " + (p.clonedFrom || "a built-in")
-    if (p.source === "local") return "local"
-    return "git"
+  function branchLabel(p) {
+    return p && p.git && p.git.branch ? p.git.branch : ""
   }
 
   // A browsable page for the remote, when there is one: https remotes as they
@@ -430,8 +494,6 @@ Item {
   function updateLine(p) {
     if (!p) return { text: "", color: root.muted }
     var u = p.update
-    if (p.source !== "git" || (u && !u.checkable))
-      return { text: "Updates are not tracked: this is not a git checkout", color: root.muted }
     if (!u) return { text: "Not checked for updates yet  (c)", color: root.muted }
     if (u.error) return { text: "Could not check: " + u.error, color: root.urgent }
     if (u.behind > 0) {
@@ -463,19 +525,17 @@ Item {
     add("License", p.license)
     add("Kinds", (p.kinds || []).join(", "))
     add("Status", p.enabled ? "enabled" : "disabled")
-    add("Source", root.sourceLabel(p))
     if (p.git) {
       add("Remote", p.git.remote)
       add("Branch", p.git.branch + (p.git.commit ? " @ " + p.git.commit : ""))
       add("Last commit", p.git.subject + (p.git.date ? "  ·  " + p.git.date.slice(0, 10) : ""))
     }
-    add("Links to", p.linkTarget)
     add("Path", p.path)
     return list
   }
 
   function handleKey(event) {
-    if (root.confirmingRemove) {
+    if (root.confirmingRemove || root.confirmingImport) {
       confirm.handleKey(event)
       event.accepted = true
       return
@@ -493,6 +553,7 @@ Item {
     else if (t === "e") root.toggleEnabled()
     else if (t === "d" || key === Qt.Key_Delete) root.askRemove()
     else if (t === "a" || t === "/") urlField.forceActiveFocus()
+    else if (t === "x") root.exportPlugins()
     else if (t === "o") root.openRepo()
     else if (t === "r") root.refresh()
     else return
@@ -519,9 +580,9 @@ Item {
   }
 
   Process {
-    id: checkProc
+    id: quickProc
     stdout: StdioCollector {
-      onStreamFinished: root.applyCheck(text)
+      onStreamFinished: root.applyQuick(text)
     }
     stderr: StdioCollector {
       onStreamFinished: if (text.trim().length > 0) console.warn(root.pluginId + " check:", text.trim())
@@ -656,7 +717,7 @@ Item {
             anchors.rightMargin: Style.spacing.controlGap
             anchors.verticalCenter: parent.verticalCenter
             foreground: root.foreground
-            placeholderText: "Git URL of a plugin to add  (a)"
+            placeholderText: "Git URL of a plugin to add, or an export .json to import  (a)"
             onAccepted: root.addPlugin()
             Keys.onEscapePressed: function(event) {
               if (urlField.text) urlField.text = ""
@@ -667,15 +728,28 @@ Item {
 
           Button {
             id: addButton
-            anchors.right: checkAllButton.left
+            anchors.right: exportButton.left
             anchors.rightMargin: Style.spacing.controlGap
             anchors.verticalCenter: parent.verticalCenter
             bordered: true
             foreground: root.foreground
             fontFamily: root.fontFamily
             text: "Add"
-            tooltipText: "Clone the plugin. It stays disabled until you enable it."
+            tooltipText: "Clone the plugin, which stays disabled until you enable it; or preview importing an export file"
             onClicked: root.addPlugin()
+          }
+
+          Button {
+            id: exportButton
+            anchors.right: checkAllButton.left
+            anchors.rightMargin: Style.spacing.controlGap
+            anchors.verticalCenter: parent.verticalCenter
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            text: "Export"
+            tooltipText: "Write your plugins to a file for another Omarchy install  (x)"
+            onClicked: root.exportPlugins()
           }
 
           Button {
@@ -755,7 +829,8 @@ Item {
                   width: parent.width
                   elide: Text.ElideRight
                   textFormat: Text.PlainText
-                  text: (row.modelData.version ? "v" + row.modelData.version + "  ·  " : "") + root.sourceLabel(row.modelData)
+                  text: [row.modelData.version ? "v" + row.modelData.version : "", root.branchLabel(row.modelData)]
+                    .filter(function(part) { return part !== "" }).join("  ·  ")
                   color: root.muted
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -993,7 +1068,7 @@ Item {
             spacing: Style.spacing.controlGap
 
             Button {
-              visible: root.current !== null && root.current.source === "git"
+              visible: root.current !== null
               bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -1003,7 +1078,7 @@ Item {
             }
 
             Button {
-              visible: root.current !== null && root.current.source === "git"
+              visible: root.current !== null
               bordered: true
               foreground: root.behind(root.current) > 0 ? root.accent : root.foreground
               fontFamily: root.fontFamily
@@ -1068,7 +1143,7 @@ Item {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
-            text: "↑↓ select   c check   u update   e enable   d remove   a add   o repo   esc close"
+            text: "↑↓ select   c check   u update   e enable   d remove   a add/import   x export   o repo   esc close"
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -1076,28 +1151,34 @@ Item {
         }
       }
 
+      // One dialog for both confirmations: removing the selected plugin, and
+      // an import whose dry run is waiting in importPreview.
       ConfirmDialog {
         id: confirm
         anchors.fill: parent
-        opened: root.confirmingRemove
+        opened: root.confirmingRemove || root.confirmingImport
         background: root.background
         foreground: root.foreground
         fontFamily: root.fontFamily
         cornerRadius: root.cornerRadius
         cancelText: "Cancel"
-        confirmText: "Remove"
+        confirmText: root.confirmingImport ? "Import" : "Remove"
         message: {
+          if (root.confirmingImport) return root.importMessage()
           var p = root.current
           if (!p) return ""
-          if (p.source === "symlink") return "Unlink " + p.name + "? The folder it points to is left alone."
-          if (p.source === "git") return "Remove " + p.name + "? Its folder is deleted; the git repo stays upstream."
-          return "Remove " + p.name + "? The folder is moved to a backup in the plugins directory."
+          return "Remove " + p.name + "? Its folder is deleted; the git repo stays upstream."
         }
         onCanceled: {
           root.confirmingRemove = false
+          root.confirmingImport = false
+          root.importPreview = null
           keyCatcher.forceActiveFocus()
         }
-        onConfirmed: root.removeCurrent()
+        onConfirmed: {
+          if (root.confirmingImport) root.importConfirmed()
+          else root.removeCurrent()
+        }
       }
     }
   }

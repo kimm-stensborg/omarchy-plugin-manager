@@ -43,7 +43,7 @@ BarWidget {
     var entries = cache.plugins || ({})
     for (var id in entries) {
       var entry = entries[id]
-      if (entry && entry.checkable && !entry.error && entry.behind > 0) names.push(id.split(".").pop())
+      if (entry && !entry.error && entry.behind > 0) names.push(id.split(".").pop())
     }
     root.pending = names
   }
