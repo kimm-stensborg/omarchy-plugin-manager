@@ -227,8 +227,11 @@ manager keeps to:
 - **It checks the file before keeping it.** The file is read back as JSONC
   after every change, and put back as it was if it does not read. A missing
   comma on the entry before the new one is added.
-- **It only touches its own entries.** It can move an entry it wrote, or take
-  it out (**Remove entry**). It never edits one it did not write.
+- **It only touches entries it looks after.** It can move an entry it wrote,
+  or take it out (**Remove entry**). The same goes for an entry a plugin wrote
+  for itself under the comment `install.sh` uses, `// ── Name (<id>)`, which is
+  how Default Applications adds its own; the list marks those
+  *(added by the plugin)*. It never edits an entry anyone else wrote.
 
 ## Export and import
 

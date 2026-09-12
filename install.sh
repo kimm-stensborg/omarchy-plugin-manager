@@ -210,6 +210,13 @@ write_menu() {
       last = n
       while (last > 0 && lines[last] !~ /^}[[:space:]]*$/) last--
       if (last == 0) { print "no closing brace in the menu file" > "/dev/stderr"; exit 1 }
+      # The entry before ours needs its comma, should a hand edit have left it
+      # off; without it the menu reads the whole file as nothing.
+      for (i = last - 1; i > 0; i--) {
+        if (lines[i] ~ /^[[:space:]]*$/ || lines[i] ~ /^[[:space:]]*\/\//) continue
+        if (lines[i] !~ /[,{][[:space:]]*$/) lines[i] = lines[i] ","
+        break
+      }
       for (i = 1; i < last; i++) print lines[i]
       # One blank line before the block, not one more per re-run.
       if (last > 1 && lines[last - 1] !~ /^[[:space:]]*$/) print ""

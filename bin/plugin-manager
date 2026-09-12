@@ -295,8 +295,11 @@ menu_entries_json() {
   menu_entries_from "$MENU_DEFAULTS" "$MENU_USER"
 }
 
-# [{plugin, entry}] for every menu entry the manager wrote: the entry on the
-# line after its comment.
+# [{plugin, entry, by}] for every menu entry the manager looks after: the entry
+# on the line after its comment. `by` is "manager" for one it wrote, and
+# "plugin" for one a plugin wrote for itself under the comment install.sh uses,
+#   // ── Name (<id>)
+# which the manager moves and removes the same way.
 menu_markers_json() {
   [[ -f $MENU_USER ]] || {
     echo '[]'
@@ -308,7 +311,7 @@ menu_markers_json() {
         key = substr($0, RSTART, RLENGTH)
         sub(/^[[:space:]]*"/, "", key)
         sub(/"[[:space:]]*:$/, "", key)
-        printf "%s\t%s\n", pending, key
+        printf "%s\t%s\t%s\n", pending, key, by
       }
       pending = ""
     }
@@ -317,7 +320,17 @@ menu_markers_json() {
       sub(/.*\(/, "", s)
       sub(/\), [^)]*$/, "", s)
       pending = s
-    }' "$MENU_USER" | jq -Rsc '[split("\n")[] | select(length > 0) | split("\t") | {plugin: .[0], entry: .[1]}]'
+      by = "manager"
+      next
+    }
+    /^[[:space:]]*\/\/ ── .*\([^()]+\)[[:space:]]*$/ {
+      s = $0
+      sub(/[[:space:]]+$/, "", s)
+      sub(/\)$/, "", s)
+      sub(/.*\(/, "", s)
+      pending = s
+      by = "plugin"
+    }' "$MENU_USER" | jq -Rsc '[split("\n")[] | select(length > 0) | split("\t") | {plugin: .[0], entry: .[1], by: .[2]}]'
 }
 
 cmd_list() {
@@ -378,7 +391,9 @@ cmd_list() {
             | .key as $k
             | {path: menupath($k), action: .value.action, entry: $k,
                label: (.value.label // ""), icon: (.value.icon // ""), description: (.value.description // ""),
-               managed: any($menuMarks[]; .plugin == $p.id and .entry == $k)} ] as $entries
+               managed: any($menuMarks[]; .plugin == $p.id and .entry == $k),
+               # "manager" when it wrote the entry, "plugin" when the plugin wrote it for itself.
+               addedBy: (first($menuMarks[] | select(.plugin == $p.id and .entry == $k) | .by) // null)} ] as $entries
         | [ ("left", "center", "right") as $section
             | (($config.bar.layout // {})[$section] // [])[]
             | select(eid == $p.id)
@@ -894,18 +909,30 @@ cmd_unbind() {
 # it when it changes. The defaults it is merged over are never touched. An id
 # that is already in use -- in the defaults, by you or by another plugin -- is
 # never written, since writing one overrides that entry; the manager picks the
-# next free one. The comment is how it finds its own entries again, and it
-# never moves or removes an entry it did not write.
+# next free one. The comment is how it finds its own entries again. An entry a
+# plugin wrote for itself, under the comment install.sh uses,
+#
+#   // ── Default Applications (io.github.kimm-stensborg.default-apps)
+#
+# is looked after the same way. Any other entry is never moved or removed.
 
-# The file without the manager's entry for <id>, and without the blank line
-# before its comment; exits 3 when there was none.
+# The file without the entry the manager looks after for <id> -- one it wrote,
+# or one the plugin wrote for itself -- and without the blank line before its
+# comment; exits 3 when there was none.
 strip_menu_block() {
   awk -v id="$1" -v mark="$MENU_MARK" '
+    function looked_after(line,   t) {
+      if (line !~ /^[[:space:]]*\/\/ /) return 0
+      if (index(line, "(" id "), " mark) > 0 && substr(line, length(line) - length(mark) + 1) == mark) return 1
+      t = line
+      sub(/[[:space:]]+$/, "", t)
+      return t ~ /^[[:space:]]*\/\/ ── / && substr(t, length(t) - length(id) - 1) == "(" id ")"
+    }
     skip {
       skip = 0
       if ($0 ~ /^[[:space:]]*"[^"]+"[[:space:]]*:/) next
     }
-    /^[[:space:]]*\/\/ / && index($0, "(" id "), " mark) > 0 && substr($0, length($0) - length(mark) + 1) == mark {
+    looked_after($0) {
       skip = 1
       found = 1
       if (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--

@@ -954,7 +954,8 @@ Item {
                       + (s.active === false ? "  (not active)" : ""))
     }
     for (var j = 0; j < opens.menu.length; j++)
-      add("Menu", opens.menu[j].path + (opens.menu[j].managed ? "  (set here)" : ""))
+      add("Menu", opens.menu[j].path + (!opens.menu[j].managed ? ""
+                  : opens.menu[j].addedBy === "plugin" ? "  (added by the plugin)" : "  (set here)"))
     for (var k = 0; k < opens.bar.length; k++) add("Bar", opens.bar[k].section + " section")
     if (opens.shortcuts.length + opens.menu.length + opens.bar.length === 0) add("Opens with", p.openCommand)
     if (p.rollback)
@@ -2478,7 +2479,10 @@ Item {
               visible: menuDialog.own !== null
               wrapMode: Text.WordWrap
               textFormat: Text.PlainText
-              text: menuDialog.own ? "Now: " + menuDialog.own.path + ", added here earlier. Saving moves it." : ""
+              text: !menuDialog.own ? ""
+                : "Now: " + menuDialog.own.path
+                  + (menuDialog.own.addedBy === "plugin" ? ", added by the plugin itself" : ", added here earlier")
+                  + ". Saving moves it."
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption

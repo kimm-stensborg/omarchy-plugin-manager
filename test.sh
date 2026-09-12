@@ -618,6 +618,39 @@ out=$("$PM" menu-remove test.alpha)
 check "removing an entry the manager did not make is refused" '.ok == false' "$out"
 "$PM" menu-remove test.kappa >/dev/null
 
+# An entry a plugin wrote for itself, under the comment install.sh uses, next
+# to one another plugin wrote the same way.
+cp "$MENU" "$SANDBOX/menu.keep"
+cat >"$MENU" <<'JSONC'
+{
+  "apps.x": {"label":"X","action":"true"},
+
+  // ── Other (test.other)
+  "setup.other":{"label":"Other","action":"omarchy-shell shell toggle test.other '{}'"},
+
+  // ── Alpha (test.alpha)
+  "setup.alpha":{"label":"Alpha","action":"omarchy-shell shell toggle test.alpha '{}'"},
+}
+JSONC
+cp "$MENU" "$SANDBOX/menu.self"
+out=$("$PM" list)
+check "an entry a plugin wrote for itself is looked after, and says who wrote it" \
+  '.plugins[] | select(.id == "test.alpha") | .opens.menu | map({entry, managed, addedBy}) == [{entry: "setup.alpha", managed: true, addedBy: "plugin"}]' "$out"
+"$PM" menu-add test.alpha --parent system --label "Alpha" >/dev/null
+holds "adding moves the plugin's entry rather than adding a second" \
+  '! grep -qF "── Alpha (test.alpha)" "$MENU" && ! grep -qF "\"setup.alpha\"" "$MENU" && [[ $(grep -c "(test.alpha), added by Plugin Manager" "$MENU") == 1 ]] && grep -qF "\"system.alpha\"" "$MENU"'
+holds "and leaves the other plugin's entry alone" \
+  'grep -qxF "  // ── Other (test.other)" "$MENU" && grep -qF "\"setup.other\"" "$MENU" && jsonc_ok "$MENU"'
+out=$("$PM" list)
+check "the moved entry is the manager's now" \
+  '.plugins[] | select(.id == "test.alpha") | any(.opens.menu[]; .entry == "system.alpha" and .addedBy == "manager")' "$out"
+cp "$SANDBOX/menu.self" "$MENU"
+out=$("$PM" menu-remove test.alpha)
+check "menu-remove takes out an entry the plugin wrote for itself" '.ok == true' "$out"
+holds "the comment and entry go, and nothing else" \
+  '! grep -qF "(test.alpha)" "$MENU" && ! grep -qF "\"setup.alpha\"" "$MENU" && grep -qF "\"setup.other\"" "$MENU" && grep -qF "\"apps.x\"" "$MENU" && jsonc_ok "$MENU"'
+cp "$SANDBOX/menu.keep" "$MENU"
+
 # ------------------------------------------------------------------- run
 export PLUGIN_MANAGER_NO_SUMMON=1
 STATE="$XDG_CACHE_HOME/omarchy/plugin-manager"
