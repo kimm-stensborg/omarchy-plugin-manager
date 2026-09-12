@@ -1,10 +1,13 @@
 # Plugin Manager
 
 One place to look after the Omarchy shell plugins you installed from git:
-list them, read their details, see how each one opens and open it, give it a
-shortcut, see which have updates waiting, review what an update brings in
-before installing it, enable, disable, remove, add new ones from a git URL,
-and carry the whole set to another Omarchy install with an export file.
+list them, read one before you switch it on, see how each opens and open it,
+give it a shortcut, see which have updates waiting, review what an update
+brings in before installing it, roll an update back, enable, disable, remove,
+add new ones from a git URL, and carry the whole set to another Omarchy
+install with an export file.
+
+![Plugin Manager](preview.png)
 
 - **Plugin ID:** `io.github.kimm-stensborg.plugin-manager`
 - **Kinds:** `overlay`, `bar-widget`
@@ -19,8 +22,8 @@ It manages **git plugins only**: the checkouts `omarchy plugin add` makes in
 - folders dropped in by hand
 - symlinks to working copies
 
-The manager lists **itself** too, so it can check for and install its own
-updates. It will not switch itself off or remove itself; use
+The manager lists **itself** too, so it can check for, install and roll back
+its own updates. It will not switch itself off or remove itself; use
 `omarchy plugin remove` for that.
 
 ## Install
@@ -59,10 +62,12 @@ omarchy-shell shell toggle io.github.kimm-stensborg.plugin-manager '{}'
 |-----|------|
 | `↑` `↓` / `j` `k`, `Home` `End` | select a plugin |
 | `⏎` | open the selected plugin |
+| `i` | read it: its files, what can run, its README |
 | `s` | give it a shortcut, or change or remove the one it has |
 | `c` | check the selected plugin for an update |
 | `C` | check every plugin |
 | `u` | review its update, then install it |
+| `b` | roll its last update back |
 | `e` | enable or disable it |
 | `d` / `Del` | remove it (asks first) |
 | `a` / `/` | type a git URL to add, or an export file to import; `⏎` goes, `Esc` leaves the field |
@@ -80,10 +85,28 @@ For every plugin:
 - its remote, branch, commit and last commit
 - **how it opens**: its shortcuts, its entries in the Omarchy menu, and its
   place in the bar
+- when it was last updated here, and what a rollback would go back to
 
 Problems are called out: a manifest the validator rejects, local changes that
 would stop an update from fast-forwarding, and a checkout that has diverged
 from upstream.
+
+## Adding, and reading before you enable
+
+Paste a git URL and press `⏎`. The plugin is cloned and validated by
+`omarchy plugin add`, and it lands **disabled**. Plugins run unsandboxed
+inside `omarchy-shell`, so the manager then shows it for reading straight
+away. You can open this view any time with `i` or **Read**. It shows:
+
+- the kinds the shell will load it as
+- every file it ships, with its size
+- which of those files are **executable**: those can run outside the shell,
+  so they are called out
+- its README
+
+**Open folder** closes the manager and opens the plugin in your file manager,
+so you can read the code itself. **Enable** switches the plugin on once you
+are satisfied.
 
 ## Updates
 
@@ -99,20 +122,34 @@ the bar on each monitor from checking at the same time. Opening the manager
 also redoes a check that is more than six hours old, and `C` checks again at
 any time.
 
-The results are cached in `~/.cache/omarchy/plugin-manager/updates.json`.
-
 ### Reviewing an update
 
 `u` does not update straight away. It fetches, then shows what the update
 brings in: the commits, the files it changes with their added and removed
 lines, and the diff itself (up to 3000 lines). Nothing changes until you
-confirm with `⏎` or **Update**; `Esc` leaves the plugin as it is. Plugins run
-unsandboxed inside `omarchy-shell`, so this is the moment to read what you
-are about to run.
+confirm with `⏎` or **Update**; `Esc` leaves the plugin as it is.
 
 When the manager updates **itself**, the shell restarts afterwards. A running
 shell keeps the old version of the manager until it restarts, so that is the
 only way the new version loads.
+
+### Rolling an update back
+
+Every update through the manager records the commit and version the plugin
+was on. `b` or **Roll back** puts the plugin back there, after asking. The
+update you undid then shows as waiting again, to install later or not at all.
+
+A rollback is one step, and it can be used once. It is refused, with the
+reason, if:
+
+- the plugin has moved on since that update
+- the plugin has local changes, which a rollback would lose
+- the old version no longer passes Omarchy's validator
+
+Rolling back the manager itself restarts the shell, like an update does.
+
+The cache in `~/.cache/omarchy/plugin-manager/updates.json` keeps the checks,
+the notifications already sent, and what each rollback goes back to.
 
 ## Opening a plugin
 
@@ -159,12 +196,6 @@ it was and nothing is kept. The comment is how the manager finds its own
 blocks again, so it can move a shortcut or remove it (**Remove shortcut**).
 It never edits a binding it did not write.
 
-## Adding
-
-Paste a git URL and press `⏎`. The plugin is cloned and validated by
-`omarchy plugin add`, and it lands **disabled**. Plugins run unsandboxed
-inside `omarchy-shell`, so read the code before you switch it on with `e`.
-
 ## Export and import
 
 `x` writes every plugin to `~/omarchy-plugins-<host>-<date>.json`. Copy that
@@ -202,17 +233,18 @@ bin/plugin-manager import <file>
 
 | Path | What |
 |------|------|
-| `Manager.qml` | the overlay: list, details, actions, review and shortcut dialogs |
+| `Manager.qml` | the overlay: list, details, actions, and the review, read and shortcut dialogs |
 | `BarWidget.qml` | the bar button, its update badge and the periodic check |
 | `bin/plugin-manager` | the backend; the only code that touches the system |
 | `install.sh` | shortcut, menu entry, bar button |
 | `test.sh` | backend tests |
 
 The backend prints one JSON document per command: `list`, `check`, `review`,
-`update`, `remove`, `add`, `enable`, `disable`, `suggest-key`, `keycheck`,
-`bind`, `unbind`, `export` and `import` (`--help` lists them). The actions
-wrap the stock `omarchy-plugin-*` commands, so cloning, validation, rollback
-and rescans work exactly as they do from the terminal.
+`inspect`, `update`, `rollback`, `remove`, `add`, `enable`, `disable`,
+`suggest-key`, `keycheck`, `bind`, `unbind`, `export` and `import`
+(`--help` lists them). The actions wrap the stock `omarchy-plugin-*`
+commands, so cloning, validation and rescans work exactly as they do from the
+terminal.
 
 Those commands finish by rescanning the shell, and a rescan unloads every open
 panel, this one included. So the overlay does not wait on them. It starts
@@ -225,8 +257,8 @@ panel, this one included. So the overlay does not wait on them. It starts
 The manager is gone for a second or two while the shell rebuilds its panels;
 no plugin can stay on screen through that.
 
-Checks, reviews, exports, import previews and shortcut changes do not rescan,
-so they run directly.
+Checks, reviews, reads, exports, import previews and shortcut changes do not
+rescan, so they run directly.
 
 ## Remove
 

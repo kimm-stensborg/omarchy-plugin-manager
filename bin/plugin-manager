@@ -8,7 +8,9 @@
 #   plugin-manager list
 #   plugin-manager check [id] [--if-stale SECONDS] [--notify]
 #   plugin-manager review <id>
+#   plugin-manager inspect <id>
 #   plugin-manager update <id>
+#   plugin-manager rollback <id>
 #   plugin-manager remove <id>
 #   plugin-manager add <git-url>
 #   plugin-manager enable <id>
@@ -35,6 +37,7 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/plugin-manager"
 CACHE="$CACHE_DIR/updates.json"
 MAX_COMMITS=20
 MAX_DIFF_LINES=3000
+MAX_README_BYTES=65536
 PLUGIN_GLYPH=$'\U000f0431'
 
 # The same non-interactive git as omarchy-plugin-update: a fetch has to fail
@@ -132,6 +135,10 @@ managed_ids() {
 
 # ------------------------------------------------------------------ cache
 
+# The cache holds the last check of every plugin under "plugins", the plugins
+# the last notification was about under "notified", and, under "history", the
+# commit each plugin was on before its last update -- what a rollback goes
+# back to.
 read_cache() {
   if [[ -s $CACHE ]] && jq -e 'type == "object"' "$CACHE" >/dev/null 2>&1; then
     cat "$CACHE"
@@ -312,6 +319,12 @@ cmd_list() {
     map(. as $p
         | .enabled = any($shell[]; (.id == $p.id or .id == $p.manifestId) and .enabled == true)
         | .update = ($cache.plugins[$p.id] // null)
+        # The update a rollback would undo: only while the plugin still sits on
+        # the commit that update left it on.
+        | .rollback = ((($cache.history // {})[$p.id] // null) as $h
+            | if $h != null and $h.to == $p.git.fullCommit
+              then {from: ($h.from[0:7]), fromVersion: ($h.fromVersion // ""), at: $h.at}
+              else null end)
         | [ $binds[]
             | select(.command | mentions($p))
             | . as $b
@@ -511,6 +524,45 @@ cmd_review() {
   rm -f "$tmp"
 }
 
+# inspect <id> -- what a plugin is, for reading before it is switched on: the
+# kinds and entry points the shell will load, every file it ships with the
+# executable ones marked -- those are what can run outside the shell -- and
+# its README.
+cmd_inspect() {
+  local id="${1:-}" dir name files readme_file="" tmp meta path mode size
+  require_managed "$id"
+  dir="$PLUGINS_DIR/$id"
+  name=$(plugin_name "$id")
+
+  files=$(git -C "$dir" ls-files -s 2>/dev/null | while IFS=$'\t' read -r meta path; do
+    mode=${meta%% *}
+    size=$(stat -c %s "$dir/$path" 2>/dev/null || echo 0)
+    jq -cn --arg path "$path" --argjson size "$size" --arg mode "$mode" \
+      '{path: $path, size: $size, executable: ($mode == "100755")}'
+  done | jq -cs .)
+
+  for path in README.md README readme.md Readme.md README.txt; do
+    [[ -f $dir/$path ]] && {
+      readme_file="$dir/$path"
+      break
+    }
+  done
+  tmp=$(mktemp)
+  [[ -n $readme_file ]] && head -c "$MAX_README_BYTES" "$readme_file" >"$tmp"
+
+  jq -cn --arg id "$id" --arg name "$name" --arg path "$dir" --argjson files "${files:-[]}" \
+    --argjson manifest "$(jq -c 'if type == "object" then . else {} end' "$dir/manifest.json" 2>/dev/null || echo '{}')" \
+    --arg readmeName "${readme_file##*/}" --rawfile readme "$tmp" '
+    {ok: true, message: "", output: "", id: $id, name: $name, path: $path,
+     kinds: ($manifest.kinds // []), entryPoints: ($manifest.entryPoints // {}),
+     keepLoaded: ($manifest.keepLoaded == true),
+     files: $files,
+     executables: [$files[] | select(.executable) | .path],
+     size: ([$files[].size] | add // 0),
+     readmeName: $readmeName, readme: $readme}'
+  rm -f "$tmp"
+}
+
 # ---------------------------------------------------------------- actions
 
 # run_stock <success-message> <id-for-reply> <command...>
@@ -525,11 +577,56 @@ run_stock() {
   fi
 }
 
+# An update records the commit and version the plugin was on, for a rollback.
 cmd_update() {
-  local id="${1:-}"
+  local id="${1:-}" dir before after version entry
   require_managed "$id"
+  dir="$PLUGINS_DIR/$id"
+  before=$(git -C "$dir" rev-parse HEAD 2>/dev/null)
+  version=$(jq -r '.version // empty' "$dir/manifest.json" 2>/dev/null)
   run_stock "" "$id" omarchy-plugin-update "$id" --yes || return 1
-  update_cache --arg id "$id" --argjson e "$(check_one "$id" 0)" '.plugins[$id] = $e'
+  after=$(git -C "$dir" rev-parse HEAD 2>/dev/null)
+  entry=$(check_one "$id" 0)
+  if [[ -n $before && $before != "$after" ]]; then
+    update_cache --arg id "$id" --argjson e "$entry" --arg from "$before" --arg to "$after" \
+      --arg version "$version" --arg now "$(date -Iseconds)" '
+      .plugins[$id] = $e
+      | .history[$id] = {from: $from, to: $to, fromVersion: $version, at: $now}'
+  else
+    update_cache --arg id "$id" --argjson e "$entry" '.plugins[$id] = $e'
+  fi
+}
+
+# rollback <id> -- put a plugin back on the commit it was on before its last
+# update through the manager. One step, once: the record goes when it is used,
+# and the update it undid shows as waiting again. The plugin must still be
+# where that update left it, with no changes of its own, and the old version
+# must still pass the validator the shell holds plugins to.
+cmd_rollback() {
+  local id="${1:-}" dir name record from to out
+  require_managed "$id"
+  dir="$PLUGINS_DIR/$id"
+  name=$(plugin_name "$id")
+
+  record=$(read_cache | jq -c --arg id "$id" '(.history // {})[$id] // empty')
+  [[ -n $record ]] || fail "there is no update of $name to roll back"
+  from=$(jq -r '.from' <<<"$record")
+  to=$(jq -r '.to' <<<"$record")
+  [[ $(git -C "$dir" rev-parse HEAD 2>/dev/null) == "$to" ]] ||
+    fail "$name has moved on since that update, so it is not rolled back"
+  [[ -z $(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null) ]] ||
+    fail "$name has local changes, which a rollback would lose"
+  git -C "$dir" cat-file -e "$from^{commit}" 2>/dev/null || fail "the commit $name was on before is gone"
+
+  git -C "$dir" reset -q --hard "$from" || fail "could not roll $name back"
+  if ! out=$(omarchy-plugin-validate "$dir" 2>&1); then
+    git -C "$dir" reset -q --hard "$to"
+    fail "the old version of $name does not validate, so it was left as it is: ${out#omarchy-plugin-validate: }"
+  fi
+
+  update_cache --arg id "$id" --argjson e "$(check_one "$id" 0)" 'del(.history[$id]) | .plugins[$id] = $e'
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1
+  reply true "Rolled back $name to $(git -C "$dir" rev-parse --short HEAD)" "" "$(jq -cn --arg id "$id" '{id: $id}')"
 }
 
 cmd_remove() {
@@ -537,7 +634,7 @@ cmd_remove() {
   require_managed "$id"
   refuse_self "$id" remove
   run_stock "" "$id" omarchy-plugin-remove "$id" --yes || return 1
-  update_cache --arg id "$id" 'del(.plugins[$id])'
+  update_cache --arg id "$id" 'del(.plugins[$id]) | del(.history[$id])'
 }
 
 cmd_add() {
@@ -1013,10 +1110,10 @@ cmd_import() {
 # running.json says what is going on; when it is done the reply lands in
 # last-action.json and the overlay is summoned back to show it.
 #
-# Kind self-update is the manager updating itself. The running shell keeps the
-# QML it compiled until it restarts, so after a successful update the shell is
-# restarted -- which stops only the quickshell processes, not this job -- and
-# the manager summoned back into the new one.
+# Kind self-update is the manager updating or rolling back itself. The running
+# shell keeps the QML it compiled until it restarts, so after either succeeds
+# the shell is restarted -- which stops only the quickshell processes, not
+# this job -- and the manager summoned back into the new one.
 cmd_run() {
   local label="" id="" kind="" seq out
   while (($# > 0)); do
@@ -1048,7 +1145,8 @@ cmd_run() {
   rm -f "$CACHE_DIR/running.json"
 
   if [[ -z ${PLUGIN_MANAGER_NO_SUMMON:-} ]]; then
-    if [[ $kind == self-update ]] && jq -e '.ok and (.message | startswith("Updated"))' >/dev/null 2>&1 <<<"$out"; then
+    if [[ $kind == self-update ]] &&
+      jq -e '.ok and (.message | test("^(Updated|Rolled back)"))' >/dev/null 2>&1 <<<"$out"; then
       omarchy-restart-shell >/dev/null 2>&1 || true
     fi
     resummon "$(jq -cn --arg seq "$seq" '{resume: $seq}')"
@@ -1095,7 +1193,9 @@ case "$command" in
 list) cmd_list ;;
 check) cmd_check "$@" ;;
 review) cmd_review "$@" ;;
+inspect) cmd_inspect "$@" ;;
 update) cmd_update "$@" ;;
+rollback) cmd_rollback "$@" ;;
 remove) cmd_remove "$@" ;;
 add) cmd_add "$@" ;;
 enable) cmd_enable "$@" ;;

@@ -7,10 +7,11 @@ import qs.Ui
 
 // Plugin Manager. Lists the git plugins in ~/.config/omarchy/plugins -- never
 // the built-in omarchy.* ones -- with their details, how each one opens,
-// whether an update is waiting, and the actions to open, review and update,
-// enable, disable, bind a shortcut to, remove or add one. It lists itself too,
-// so it can update itself, but it will not switch itself off or remove itself.
-// Every action runs bin/plugin-manager; this file only renders what comes back.
+// whether an update is waiting, and the actions to open, read, review and
+// update, roll back, enable, disable, bind a shortcut to, remove or add one.
+// It lists itself too, so it can update itself, but it will not switch itself
+// off or remove itself. Every action runs bin/plugin-manager; this file only
+// renders what comes back.
 Item {
   id: root
 
@@ -39,8 +40,8 @@ Item {
   property bool listedOnce: false
   property bool relistPending: false
 
-  // Update checks, reviews, exports, import previews and shortcut changes run
-  // in-process: none of them rescans the shell.
+  // Update checks, reviews, reads, exports, import previews and shortcut
+  // changes run in-process: none of them rescans the shell.
   property string busyLabel: ""
   property string busyId: ""
   property string busyKind: ""
@@ -56,6 +57,14 @@ Item {
   readonly property var reviewFiles: root.review && root.review.files ? root.review.files : []
   readonly property var reviewLines: root.review && root.review.diff
     ? String(root.review.diff).replace(/\n$/, "").split("\n") : []
+
+  // A plugin being read before it is switched on: `plugin-manager inspect`.
+  // A plugin just added is read as soon as the list has it.
+  property bool inspecting: false
+  property var inspection: null
+  property string pendingInspect: ""
+
+  property bool confirmingRollback: false
 
   // The shortcut dialog, and what the backend made of the keys typed into it.
   property bool binding: false
@@ -145,9 +154,12 @@ Item {
   function closeDialogs() {
     root.confirmingRemove = false
     root.confirmingImport = false
+    root.confirmingRollback = false
     root.importPreview = null
     root.reviewing = false
     root.review = null
+    root.inspecting = false
+    root.inspection = null
     root.binding = false
     root.keyCheck = null
   }
@@ -162,7 +174,8 @@ Item {
   function ping() { return "ok" }
 
   // For driving the overlay over IPC (`omarchy-shell shell call <id> …`): a
-  // script selects by id and reads the selection back before acting on it.
+  // script selects by id and reads the selection back before acting on it,
+  // and finds the card on screen to take a picture of it.
   function currentId() { return root.current ? root.current.id : "" }
 
   function selectById(id) {
@@ -173,6 +186,12 @@ Item {
       }
     }
     return "missing"
+  }
+
+  function cardGeometry() {
+    var p = card.mapToItem(null, 0, 0)
+    return JSON.stringify({ x: Math.round(p.x), y: Math.round(p.y),
+                            width: Math.round(card.width), height: Math.round(card.height) })
   }
 
   // ------------------------------------------------------------------ list
@@ -203,18 +222,19 @@ Item {
     root.selectedIndex = Math.max(0, index)
     root.selectId = ""
     root.now = Date.now()
+    root.inspectPending()
   }
 
   // --------------------------------------------------------------- actions
 
-  readonly property var quickKinds: ["check", "export", "preview", "review", "bind", "unbind"]
+  readonly property var quickKinds: ["check", "export", "preview", "review", "inspect", "bind", "unbind"]
 
   // One action at a time: they all end in the stock commands, which rescan
   // the shell and would trip over each other.
   function runAction(args, label, id, kind, quiet) {
     if (root.busy || quickProc.running) {
       if (!quiet) root.setStatus("Still " + root.activityLabel.toLowerCase() + " …", false)
-      return
+      return false
     }
     if (!quiet) root.setStatus("", false)
 
@@ -226,7 +246,7 @@ Item {
       root.busyQuiet = quiet === true
       quickProc.command = [root.backend].concat(args)
       quickProc.running = true
-      return
+      return true
     }
 
     root.jobLabel = label
@@ -235,6 +255,7 @@ Item {
     root.launchedAt = Date.now()
     Quickshell.execDetached([root.backend, "run", "--label", label, "--id", id || "", "--kind", kind, "--"]
                             .concat(args))
+    return true
   }
 
   function applyQuick(text) {
@@ -256,6 +277,9 @@ Item {
       return
     } else if (kind === "review") {
       root.showReview(payload)
+    } else if (kind === "inspect") {
+      root.showInspect(payload)
+      return
     } else {
       root.setStatus(payload.message, false)
     }
@@ -314,6 +338,8 @@ Item {
       root.setStatus(payload.message || (label + " done"), false)
       if (kind === "add" && payload.id) {
         root.selectId = payload.id
+        // A plugin lands disabled so it can be read first; open it for reading.
+        root.pendingInspect = payload.id
         urlField.text = ""
       }
     }
@@ -388,23 +414,28 @@ Item {
     root.runAction(["update", r.id], "Updating " + r.name, r.id, isSelf ? "self-update" : "update", false)
   }
 
-  function scrollReview(dy) {
-    var max = Math.max(0, reviewList.contentHeight - reviewList.height)
-    reviewList.contentY = Math.max(0, Math.min(max, reviewList.contentY + dy))
+  function scrollView(view, dy) {
+    var max = Math.max(0, view.contentHeight - view.height)
+    view.contentY = Math.max(0, Math.min(max, view.contentY + dy))
   }
 
-  function reviewKey(event) {
+  // j/k, arrows, PgUp/PgDn, space, Home and End for a scrolling dialog.
+  function scrollKey(view, event) {
     var key = event.key
     var t = event.text
     var line = Style.font.caption + Style.spacing.xxs
-    if (key === Qt.Key_Escape) root.cancelReview()
-    else if (key === Qt.Key_Return || key === Qt.Key_Enter) root.confirmUpdate()
-    else if (key === Qt.Key_Down || t === "j") root.scrollReview(line * 3)
-    else if (key === Qt.Key_Up || t === "k") root.scrollReview(-line * 3)
-    else if (key === Qt.Key_PageDown || key === Qt.Key_Space) root.scrollReview(reviewList.height * 0.9)
-    else if (key === Qt.Key_PageUp) root.scrollReview(-reviewList.height * 0.9)
-    else if (key === Qt.Key_Home) reviewList.contentY = 0
-    else if (key === Qt.Key_End) root.scrollReview(reviewList.contentHeight)
+    if (key === Qt.Key_Down || t === "j") root.scrollView(view, line * 3)
+    else if (key === Qt.Key_Up || t === "k") root.scrollView(view, -line * 3)
+    else if (key === Qt.Key_PageDown || key === Qt.Key_Space) root.scrollView(view, view.height * 0.9)
+    else if (key === Qt.Key_PageUp) root.scrollView(view, -view.height * 0.9)
+    else if (key === Qt.Key_Home) view.contentY = 0
+    else if (key === Qt.Key_End) root.scrollView(view, view.contentHeight)
+  }
+
+  function reviewKey(event) {
+    if (event.key === Qt.Key_Escape) root.cancelReview()
+    else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) root.confirmUpdate()
+    else root.scrollKey(reviewList, event)
   }
 
   function diffColor(line) {
@@ -414,6 +445,112 @@ Item {
     if (line.indexOf("@@") === 0) return root.selectedText
     return root.foreground
   }
+
+  // ---------------------------------------------------------------- reading
+
+  // What a plugin is, before it runs: the kinds the shell will load it as,
+  // the files it ships -- the executable ones marked -- and its README.
+  function inspectCurrent() {
+    var p = root.current
+    if (p) root.runAction(["inspect", p.id], "Reading " + p.name, p.id, "inspect", false)
+  }
+
+  // A plugin just added is read as soon as nothing else is running; until
+  // then it waits here, and the list or the check that finishes tries again.
+  function inspectPending() {
+    var id = root.pendingInspect
+    if (!id || root.busy || quickProc.running) return
+    if (root.runAction(["inspect", id], "Reading " + root.nameOf(id), id, "inspect", true)) root.pendingInspect = ""
+  }
+
+  function showInspect(payload) {
+    root.inspection = payload
+    root.inspecting = true
+    Qt.callLater(function() { inspectView.contentY = 0 })
+  }
+
+  function closeInspect() {
+    root.inspecting = false
+    root.inspection = null
+    keyCatcher.forceActiveFocus()
+    root.inspectPending()
+  }
+
+  function inspectedPlugin() {
+    var i = root.inspection
+    if (!i) return null
+    for (var k = 0; k < root.plugins.length; k++) if (root.plugins[k].id === i.id) return root.plugins[k]
+    return null
+  }
+
+  function enableInspected() {
+    var p = root.inspectedPlugin()
+    root.closeInspect()
+    if (!p || p.enabled || p.self) return
+    root.selectById(p.id)
+    root.toggleEnabled()
+  }
+
+  // The file manager cannot be used under the overlay, so the manager closes.
+  function openFolder(path) {
+    if (!path) return
+    root.dismiss()
+    Quickshell.execDetached(["uwsm-app", "--", "xdg-open", path])
+  }
+
+  function inspectKey(event) {
+    var t = event.text
+    if (event.key === Qt.Key_Escape) root.closeInspect()
+    else if (t === "e") root.enableInspected()
+    else if (t === "f") root.openFolder(root.inspection ? root.inspection.path : "")
+    else root.scrollKey(inspectView, event)
+  }
+
+  // Markdown for the dialog: images out, since the dialog is no place for a
+  // screenshot at full size.
+  function readmeText(text) {
+    return String(text || "").replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+  }
+
+  function sizeText(bytes) {
+    if (bytes < 1024) return bytes + " B"
+    if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + " KB"
+    return (bytes / 1024 / 1024).toFixed(1) + " MB"
+  }
+
+  // -------------------------------------------------------------- rollback
+
+  function askRollback() {
+    var p = root.current
+    if (!p || root.busy) return
+    if (!p.rollback) {
+      root.setStatus("There is no update of " + p.name + " to roll back", false)
+      return
+    }
+    confirm.selectedIndex = 0
+    root.confirmingRollback = true
+  }
+
+  function rollbackMessage() {
+    var p = root.current
+    if (!p || !p.rollback) return ""
+    var text = "Roll " + p.name + " back to " + p.rollback.from
+      + (p.rollback.fromVersion ? " (v" + p.rollback.fromVersion + ")" : "")
+      + ", where it was before its update " + root.ago(p.rollback.at) + "?"
+    text += "\n\nThe update shows as waiting again, to install later."
+    if (p.self) text += " The shell restarts afterwards."
+    return text
+  }
+
+  function rollbackCurrent() {
+    root.confirmingRollback = false
+    keyCatcher.forceActiveFocus()
+    var p = root.current
+    if (!p) return
+    root.runAction(["rollback", p.id], "Rolling back " + p.name, p.id, p.self ? "self-update" : "rollback", false)
+  }
+
+  // --------------------------------------------------------- other actions
 
   function toggleEnabled() {
     var p = root.current
@@ -724,6 +861,9 @@ Item {
     for (var j = 0; j < opens.menu.length; j++) add("Menu", opens.menu[j].path)
     for (var k = 0; k < opens.bar.length; k++) add("Bar", opens.bar[k].section + " section")
     if (opens.shortcuts.length + opens.menu.length + opens.bar.length === 0) add("Opens with", p.openCommand)
+    if (p.rollback)
+      add("Last update", root.ago(p.rollback.at) + ", from " + p.rollback.from
+                         + (p.rollback.fromVersion ? " (v" + p.rollback.fromVersion + ")" : "") + "  ·  b rolls it back")
     if (p.git) {
       add("Remote", p.git.remote)
       add("Branch", p.git.branch + (p.git.commit ? " @ " + p.git.commit : ""))
@@ -739,12 +879,17 @@ Item {
       event.accepted = true
       return
     }
+    if (root.inspecting) {
+      root.inspectKey(event)
+      event.accepted = true
+      return
+    }
     if (root.binding) {
       if (event.key === Qt.Key_Escape) root.closeBind()
       event.accepted = true
       return
     }
-    if (root.confirmingRemove || root.confirmingImport) {
+    if (root.confirmingRemove || root.confirmingImport || root.confirmingRollback) {
       confirm.handleKey(event)
       event.accepted = true
       return
@@ -757,9 +902,11 @@ Item {
     else if (key === Qt.Key_Home) root.select(0)
     else if (key === Qt.Key_End) root.select(root.plugins.length - 1)
     else if (key === Qt.Key_Return || key === Qt.Key_Enter) root.openPlugin()
+    else if (t === "i") root.inspectCurrent()
     else if (t === "c") root.checkCurrent()
     else if (t === "C") root.checkAll()
     else if (t === "u") root.updateCurrent()
+    else if (t === "b") root.askRollback()
     else if (t === "e") root.toggleEnabled()
     else if (t === "s") root.askBind()
     else if (t === "d" || key === Qt.Key_Delete) root.askRemove()
@@ -798,6 +945,7 @@ Item {
     stderr: StdioCollector {
       onStreamFinished: if (text.trim().length > 0) console.warn(root.pluginId + " action:", text.trim())
     }
+    onExited: Qt.callLater(root.inspectPending)
   }
 
   // Suggestions and checks for the shortcut dialog, apart from quickProc so
@@ -1288,31 +1436,68 @@ Item {
             }
           }
 
-          Row {
+          // The actions under the details. Right to left, so they sit against
+          // the right edge and wrap onto a second row rather than run under
+          // the list; the children are listed last to first for that reason.
+          Flow {
             id: actions
             visible: root.current !== null
+            anchors.left: divider.right
+            anchors.leftMargin: root.contentMargin
             anchors.right: parent.right
             anchors.bottom: parent.bottom
+            layoutDirection: Qt.RightToLeft
             spacing: Style.spacing.controlGap
 
+            // Plain like the rest: the confirmation is where it turns red.
             Button {
-              visible: root.current !== null && !root.currentIsSelf
+              visible: !root.currentIsSelf
               bordered: true
-              foreground: root.current && root.current.openCommand && root.current.enabled ? root.foreground : root.muted
+              foreground: root.foreground
               fontFamily: root.fontFamily
-              text: "Open"
-              tooltipText: "Close the manager and open this plugin  (⏎)"
-              onClicked: root.openPlugin()
+              text: "Remove"
+              tooltipText: "Uninstall the plugin  (d)"
+              onClicked: root.askRemove()
+            }
+
+            Button {
+              visible: root.webUrl(root.current) !== ""
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              text: "Open repo"
+              tooltipText: "Open the repository in the browser  (o)"
+              onClicked: root.openRepo()
+            }
+
+            Button {
+              visible: !root.currentIsSelf
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              text: root.current && root.current.enabled ? "Disable" : "Enable"
+              tooltipText: "Switch the plugin on or off  (e)"
+              onClicked: root.toggleEnabled()
+            }
+
+            Button {
+              visible: root.current !== null && root.current.rollback !== null && root.current.rollback !== undefined
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              text: "Roll back"
+              tooltipText: "Go back to where it was before its last update  (b)"
+              onClicked: root.askRollback()
             }
 
             Button {
               visible: root.current !== null
               bordered: true
-              foreground: root.current && root.current.openCommand ? root.foreground : root.muted
+              foreground: root.behind(root.current) > 0 ? root.accent : root.foreground
               fontFamily: root.fontFamily
-              text: "Shortcut…"
-              tooltipText: "Bind a key combination that opens this plugin  (s)"
-              onClicked: root.askBind()
+              text: root.behind(root.current) > 0 ? "Update (" + root.behind(root.current) + ")" : "Update"
+              tooltipText: "Review what an update brings in, then update  (u)"
+              onClicked: root.updateCurrent()
             }
 
             Button {
@@ -1328,42 +1513,31 @@ Item {
             Button {
               visible: root.current !== null
               bordered: true
-              foreground: root.behind(root.current) > 0 ? root.accent : root.foreground
+              foreground: root.foreground
               fontFamily: root.fontFamily
-              text: root.behind(root.current) > 0 ? "Update (" + root.behind(root.current) + ")" : "Update"
-              tooltipText: "Review what an update brings in, then update  (u)"
-              onClicked: root.updateCurrent()
+              text: "Read"
+              tooltipText: "Its files, what can run, and its README  (i)"
+              onClicked: root.inspectCurrent()
             }
 
             Button {
-              visible: !root.currentIsSelf
+              visible: root.current !== null
               bordered: true
-              foreground: root.foreground
+              foreground: root.current && root.current.openCommand ? root.foreground : root.muted
               fontFamily: root.fontFamily
-              text: root.current && root.current.enabled ? "Disable" : "Enable"
-              tooltipText: "Switch the plugin on or off  (e)"
-              onClicked: root.toggleEnabled()
+              text: "Shortcut…"
+              tooltipText: "Bind a key combination that opens this plugin  (s)"
+              onClicked: root.askBind()
             }
 
             Button {
-              visible: root.webUrl(root.current) !== ""
+              visible: root.current !== null && !root.currentIsSelf
               bordered: true
-              foreground: root.foreground
+              foreground: root.current && root.current.openCommand && root.current.enabled ? root.foreground : root.muted
               fontFamily: root.fontFamily
-              text: "Open repo"
-              tooltipText: "Open the repository in the browser  (o)"
-              onClicked: root.openRepo()
-            }
-
-            // Plain like the rest: the confirmation is where it turns red.
-            Button {
-              visible: !root.currentIsSelf
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              text: "Remove"
-              tooltipText: "Uninstall the plugin  (d)"
-              onClicked: root.askRemove()
+              text: "Open"
+              tooltipText: "Close the manager and open this plugin  (⏎)"
+              onClicked: root.openPlugin()
             }
           }
         }
@@ -1393,7 +1567,7 @@ Item {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
-            text: "↑↓ select   ⏎ open   s shortcut   c check   u update   e enable   d remove   a add/import   x export   o repo   esc close"
+            text: "⏎ open  i read  s shortcut  c check  u update  b roll back  e enable  d remove  a add  x export  esc close"
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -1401,20 +1575,22 @@ Item {
         }
       }
 
-      // One dialog for both confirmations: removing the selected plugin, and
-      // an import whose dry run is waiting in importPreview.
+      // One dialog for the confirmations: removing the selected plugin,
+      // rolling it back, and an import whose dry run is waiting in
+      // importPreview.
       ConfirmDialog {
         id: confirm
         anchors.fill: parent
-        opened: root.confirmingRemove || root.confirmingImport
+        opened: root.confirmingRemove || root.confirmingImport || root.confirmingRollback
         background: root.background
         foreground: root.foreground
         fontFamily: root.fontFamily
         cornerRadius: root.cornerRadius
         cancelText: "Cancel"
-        confirmText: root.confirmingImport ? "Import" : "Remove"
+        confirmText: root.confirmingImport ? "Import" : (root.confirmingRollback ? "Roll back" : "Remove")
         message: {
           if (root.confirmingImport) return root.importMessage()
+          if (root.confirmingRollback) return root.rollbackMessage()
           var p = root.current
           if (!p) return ""
           return "Remove " + p.name + "? Its folder is deleted; the git repo stays upstream."
@@ -1422,11 +1598,13 @@ Item {
         onCanceled: {
           root.confirmingRemove = false
           root.confirmingImport = false
+          root.confirmingRollback = false
           root.importPreview = null
           keyCatcher.forceActiveFocus()
         }
         onConfirmed: {
           if (root.confirmingImport) root.importConfirmed()
+          else if (root.confirmingRollback) root.rollbackCurrent()
           else root.removeCurrent()
         }
       }
@@ -1628,6 +1806,230 @@ Item {
                   fontFamily: root.fontFamily
                   text: "Update"
                   onClicked: root.confirmUpdate()
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // ------------------------------------------------------------- read
+      // A plugin before it runs: what the shell loads it as, the files it
+      // ships with the executable ones called out, and its README.
+      Item {
+        id: inspectDialog
+        anchors.fill: parent
+        visible: root.inspecting
+
+        readonly property var info: root.inspection
+        readonly property var plugin: root.inspecting ? root.inspectedPlugin() : null
+
+        Rectangle {
+          anchors.fill: parent
+          color: Util.alpha(root.background, 0.7)
+
+          MouseArea {
+            anchors.fill: parent
+            onClicked: root.closeInspect()
+          }
+        }
+
+        BorderSurface {
+          id: inspectCard
+          anchors.fill: parent
+          anchors.margins: Style.space(24)
+          color: root.background
+          borderSpec: Border.flat(root.accent, Style.normalBorderWidth)
+          padding: Style.space(18)
+          radius: root.cornerRadius
+
+          MouseArea {
+            anchors.fill: parent
+            onClicked: keyCatcher.forceActiveFocus()
+          }
+
+          Item {
+            anchors.fill: parent
+            anchors.topMargin: inspectCard.contentTopInset
+            anchors.rightMargin: inspectCard.contentRightInset
+            anchors.bottomMargin: inspectCard.contentBottomInset
+            anchors.leftMargin: inspectCard.contentLeftInset
+
+            Text {
+              id: inspectTitle
+              anchors { left: parent.left; right: parent.right; top: parent.top }
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              text: inspectDialog.info ? inspectDialog.info.name : ""
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.heading
+              font.bold: true
+            }
+
+            Text {
+              id: inspectSummary
+              anchors { left: parent.left; right: parent.right; top: inspectTitle.bottom; topMargin: Style.spacing.md }
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              text: {
+                var i = inspectDialog.info
+                if (!i) return ""
+                var parts = [(i.kinds || []).join(", ") || "no kinds",
+                             i.files.length + (i.files.length === 1 ? " file" : " files"),
+                             root.sizeText(i.size)]
+                if (i.keepLoaded) parts.push("stays loaded")
+                var text = parts.join("  ·  ")
+                var p = inspectDialog.plugin
+                if (p && !p.enabled && !p.self)
+                  text += "\nIt is disabled. Plugins run unsandboxed inside the shell, so read it before you switch it on."
+                return text
+              }
+            }
+
+            Text {
+              id: inspectRunnable
+              anchors { left: parent.left; right: parent.right; top: inspectSummary.bottom; topMargin: Style.spacing.md }
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              readonly property var runnable: inspectDialog.info ? inspectDialog.info.executables : []
+              text: runnable.length === 0
+                ? "No executable files: it runs only as QML inside the shell."
+                : "⚠ Can run outside the shell: " + runnable.join(", ")
+              color: runnable.length === 0 ? root.muted : root.urgent
+            }
+
+            Flickable {
+              id: inspectView
+              anchors {
+                left: parent.left; right: parent.right
+                top: inspectRunnable.bottom; topMargin: Style.spacing.lg
+                bottom: inspectFooter.top; bottomMargin: Style.spacing.md
+              }
+              clip: true
+              contentWidth: width
+              contentHeight: inspectColumn.implicitHeight
+              boundsBehavior: Flickable.StopAtBounds
+
+              Column {
+                id: inspectColumn
+                width: inspectView.width
+                spacing: Style.spacing.xxs
+
+                Repeater {
+                  model: inspectDialog.info ? inspectDialog.info.files : []
+
+                  Row {
+                    id: inspectFile
+                    required property var modelData
+                    spacing: Style.spacing.lg
+
+                    Text {
+                      width: Style.space(64)
+                      horizontalAlignment: Text.AlignRight
+                      textFormat: Text.PlainText
+                      text: root.sizeText(inspectFile.modelData.size)
+                      color: root.muted
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Text {
+                      width: inspectColumn.width - Style.space(64) - Style.spacing.lg
+                      elide: Text.ElideMiddle
+                      textFormat: Text.PlainText
+                      text: inspectFile.modelData.path + (inspectFile.modelData.executable ? "   (executable)" : "")
+                      color: inspectFile.modelData.executable ? root.urgent : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                }
+
+                Item {
+                  width: parent.width
+                  height: Style.spacing.lg
+                }
+
+                Rectangle {
+                  width: parent.width
+                  height: 1
+                  color: root.faint
+                }
+
+                Item {
+                  width: parent.width
+                  height: Style.spacing.lg
+                }
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  textFormat: inspectDialog.info && inspectDialog.info.readme ? Text.MarkdownText : Text.PlainText
+                  text: inspectDialog.info && inspectDialog.info.readme
+                    ? root.readmeText(inspectDialog.info.readme)
+                    : "It has no README."
+                  color: inspectDialog.info && inspectDialog.info.readme ? root.foreground : root.muted
+                  linkColor: root.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
+            }
+
+            Item {
+              id: inspectFooter
+              anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+              height: inspectButtons.implicitHeight
+
+              Text {
+                anchors.left: parent.left
+                anchors.right: inspectButtons.left
+                anchors.rightMargin: Style.spacing.xl
+                anchors.verticalCenter: parent.verticalCenter
+                elide: Text.ElideRight
+                textFormat: Text.PlainText
+                text: "↑↓ PgUp PgDn scroll   f open folder   e enable   esc close"
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Row {
+                id: inspectButtons
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.spacing.controlGap
+
+                Button {
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  text: "Open folder"
+                  tooltipText: "Read the code in the file manager; the manager closes  (f)"
+                  onClicked: root.openFolder(inspectDialog.info ? inspectDialog.info.path : "")
+                }
+
+                Button {
+                  visible: inspectDialog.plugin !== null && !inspectDialog.plugin.enabled && !inspectDialog.plugin.self
+                  bordered: true
+                  foreground: root.accent
+                  fontFamily: root.fontFamily
+                  text: "Enable"
+                  onClicked: root.enableInspected()
+                }
+
+                Button {
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  text: "Close"
+                  onClicked: root.closeInspect()
                 }
               }
             }

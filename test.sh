@@ -436,6 +436,51 @@ check "a plugin that cannot be fetched cannot be reviewed" '.ok == false and (.m
 out=$("$PM" review test.gamma)
 check "a plugin that is not git cannot be reviewed" '.ok == false and (.message | test("not a git plugin"))' "$out"
 
+# --------------------------------------------------------------- inspect
+printf '# Kappa\n\nOpens the **kappa** window.\n' >"$PLUGINS/test.kappa/README.md"
+commit_all "$PLUGINS/test.kappa" "Add a README"
+out=$("$PM" inspect test.kappa)
+check "inspect names the plugin, its kinds and entry points" \
+  '.ok == true and .name == "test.kappa name" and .kinds == ["overlay"] and .entryPoints == {overlay: "Overlay.qml"}' "$out"
+check "inspect lists every file it ships, with sizes" \
+  '[.files[].path] == ["Overlay.qml", "README.md", "bin/kappa-open", "manifest.json"] and all(.files[]; .size > 0)' "$out"
+check "inspect marks the files that can run" '.executables == ["bin/kappa-open"]' "$out"
+check "inspect carries the README" '.readmeName == "README.md" and (.readme | test("\\*\\*kappa\\*\\* window"))' "$out"
+out=$("$PM" inspect test.theta)
+check "a plugin without a README says so" '.ok == true and .readmeName == "" and .readme == ""' "$out"
+out=$("$PM" inspect test.beta)
+check "a plugin that is not git cannot be inspected" '.ok == false' "$out"
+
+# -------------------------------------------------------------- rollback
+out=$("$PM" rollback test.kappa)
+check "a plugin never updated here has nothing to roll back" '.ok == false and (.message | test("no update"))' "$out"
+# alpha is one commit behind since the review above.
+before=$(git -C "$PLUGINS/test.alpha" rev-parse HEAD)
+"$PM" update test.alpha >/dev/null
+after=$(git -C "$PLUGINS/test.alpha" rev-parse HEAD)
+check "an update records what a rollback would go back to" \
+  ".plugins[] | select(.id == \"test.alpha\") | .rollback.from == \"${before:0:7}\" and .rollback.fromVersion == \"1.1.0\"" "$("$PM" list)"
+echo "// local edit" >>"$PLUGINS/test.alpha/Overlay.qml"
+out=$("$PM" rollback test.alpha)
+check "a rollback over local changes is refused" '.ok == false and (.message | test("local changes"))' "$out"
+git -C "$PLUGINS/test.alpha" checkout -q -- Overlay.qml
+: >"$SHELL_LOG"
+out=$("$PM" rollback test.alpha)
+check "a rollback succeeds and says where to" ".ok == true and .message == \"Rolled back test.alpha name to ${before:0:7}\"" "$out"
+holds "the plugin is back on the commit it was on" '[[ $(git -C "$PLUGINS/test.alpha" rev-parse HEAD) == "$before" ]]'
+holds "the shell is asked to reload it" 'grep -qx rescanPlugins "$SHELL_LOG"'
+check "the undone update shows as waiting again, with no second rollback on offer" \
+  '.plugins[] | select(.id == "test.alpha") | .update.behind == 1 and .rollback == null' "$("$PM" list)"
+out=$("$PM" rollback test.alpha)
+check "a rollback is one step, once" '.ok == false' "$out"
+"$PM" update test.alpha >/dev/null
+git -C "$PLUGINS/test.alpha" commit -q --allow-empty -m "Move on"
+check "a plugin that has moved on since its update offers no rollback" \
+  '.plugins[] | select(.id == "test.alpha") | .rollback == null' "$("$PM" list)"
+out=$("$PM" rollback test.alpha)
+check "and refuses one" '.ok == false and (.message | test("moved on"))' "$out"
+git -C "$PLUGINS/test.alpha" reset -q --hard "$after"
+
 # ------------------------------------------------------------- shortcuts
 out=$("$PM" suggest-key test.kappa)
 check "a suggestion starts from the plugin's initials" '.ok == true and .keys == "SUPER + ALT + T"' "$out"
