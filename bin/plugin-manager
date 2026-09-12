@@ -807,11 +807,14 @@ strip_bind_block() {
       return substr(t, length(t) - length(id) - 1) == "(" id ")"
     }
     looked_after($0) {
-      skip = 1; found = 1
+      skip = 1; bound = 0; found = 1
       if (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
       next
     }
-    skip && ($0 ~ /^hl\.unbind\(/ || $0 ~ /^o\.bind\(/) { next }
+    skip && !bound && $0 ~ /^hl\.unbind\(/ { next }
+    # The block ends at its binding. Any more after it are skipped only when
+    # they name the plugin: a binding written straight below belongs to others.
+    skip && $0 ~ /^o\.bind\(/ && (!bound || index($0, id) > 0) { bound = 1; next }
     { skip = 0; lines[++n] = $0 }
     END {
       while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
