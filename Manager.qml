@@ -824,6 +824,46 @@ Item {
     return null
   }
 
+  // The shortcut and menu section under the details. What the manager can
+  // move (what it set, or the plugin's installer) gets Change and Remove;
+  // otherwise Add, which leaves anything set elsewhere alone and adds another.
+  // A plugin with nothing to open shows only what it already has.
+  function openers(p) {
+    if (!p) return []
+    var opens = p.opens || { shortcuts: [], menu: [] }
+    var canOpen = !!p.openCommand
+    function actions(own, kind, what) {
+      if (!canOpen) return []
+      var key = kind === "shortcut" ? "s" : "m"
+      return own
+        ? [{ text: "Change", kind: kind, tip: "Change the " + what + "  (" + key + ")" },
+           { text: "Remove", kind: kind + "-remove", tip: "Remove the " + what }]
+        : [{ text: "Add", kind: kind, tip: "Add a " + what + " that opens this plugin  (" + key + ")" }]
+    }
+    var rows = [
+      { title: "Shortcut",
+        lines: opens.shortcuts.map(function(s) {
+          return s.keys + (s.description ? "  ·  " + s.description : "")
+                 + (s.managed ? "  (set here)" : "") + (s.active === false ? "  (not active)" : "")
+        }),
+        actions: actions(root.managedShortcut(p), "shortcut", "shortcut") },
+      { title: "Menu",
+        lines: opens.menu.map(function(m) {
+          return m.path + (!m.managed ? "" : m.addedBy === "plugin" ? "  (added by the plugin)" : "  (set here)")
+        }),
+        actions: actions(root.managedMenu(p), "menu", "menu entry") }
+    ]
+    return rows.filter(function(r) { return canOpen || r.lines.length > 0 })
+               .map(function(r) { if (!r.lines.length) r.lines = ["none"]; return r })
+  }
+
+  function openerAction(kind) {
+    if (kind === "shortcut") root.askBind()
+    else if (kind === "shortcut-remove") root.removeBind()
+    else if (kind === "menu") root.askMenu()
+    else if (kind === "menu-remove") root.removeMenu()
+  }
+
   // "setup.plugin.kappa" sits under "setup.plugin"; a top-level id under "".
   function parentOf(entry) {
     var parts = String(entry || "").split(".")
@@ -937,40 +977,16 @@ Item {
   function fields(p) {
     var list = []
     if (!p) return list
-    // Lines given an action, even an empty one, keep room for its button so
-    // their values line up.
-    function add(label, value, action, actionText) {
-      if (value) list.push({ label: label, value: String(value), slot: action !== undefined,
-                             action: action || "", actionText: actionText || "" })
-    }
+    function add(label, value) { if (value) list.push({ label: label, value: String(value) }) }
     add("Id", p.id)
     if (p.manifestId && p.manifestId !== p.id) add("Manifest id", p.manifestId)
     add("Author", p.author)
     add("License", p.license)
     add("Kinds", (p.kinds || []).join(", "))
     add("Status", p.enabled ? "enabled" : "disabled")
-    // How it opens: its shortcuts, menu entries and place in the bar. With
-    // none of those, the command the Open button runs.
-    // The Shortcut and Menu lines carry the small button that opens their
-    // dialog: on the line set here when there is one, since saving moves it,
-    // else on the first; with neither, on a line saying so.
+    // Its place in the bar. Shortcuts and menu entries have their own section
+    // under these; with none of the three, the command the Open button runs.
     var opens = p.opens || { shortcuts: [], menu: [], bar: [] }
-    var canOpen = !!p.openCommand
-    var ownKey = opens.shortcuts.findIndex(function(s) { return s.managed })
-    for (var i = 0; i < opens.shortcuts.length; i++) {
-      var s = opens.shortcuts[i]
-      add("Shortcut", s.keys + (s.description ? "  ·  " + s.description : "")
-                      + (s.managed ? "  (set here)" : "")
-                      + (s.active === false ? "  (not active)" : ""),
-          canOpen && i === Math.max(ownKey, 0) ? "shortcut" : "", "Change")
-    }
-    if (canOpen && opens.shortcuts.length === 0) add("Shortcut", "none", "shortcut", "Add")
-    var ownEntry = opens.menu.findIndex(function(m) { return m.managed && m.addedBy !== "plugin" })
-    for (var j = 0; j < opens.menu.length; j++)
-      add("Menu", opens.menu[j].path + (!opens.menu[j].managed ? ""
-                  : opens.menu[j].addedBy === "plugin" ? "  (added by the plugin)" : "  (set here)"),
-          canOpen && j === Math.max(ownEntry, 0) ? "menu" : "", "Change")
-    if (canOpen && opens.menu.length === 0) add("Menu", "none", "menu", "Add")
     for (var k = 0; k < opens.bar.length; k++) add("Bar", opens.bar[k].section + " section")
     if (opens.shortcuts.length + opens.menu.length + opens.bar.length === 0) add("Opens with", p.openCommand)
     if (p.rollback)
@@ -1533,7 +1549,6 @@ Item {
 
                   Text {
                     width: root.labelWidth
-                    anchors.verticalCenter: fieldRow.modelData.slot ? parent.verticalCenter : undefined
                     textFormat: Text.PlainText
                     text: fieldRow.modelData.label
                     color: root.muted
@@ -1541,52 +1556,91 @@ Item {
                     font.pixelSize: Style.font.caption
                   }
 
-                  // Room for the button that opens the shortcut or menu dialog,
-                  // as wide as a Change button whether or not this line has one.
-                  Item {
-                    id: fieldSlot
-                    visible: fieldRow.modelData.slot
-                    width: slotSizer.implicitWidth
-                    height: slotSizer.implicitHeight
-
-                    Button {
-                      id: slotSizer
-                      visible: false
-                      bordered: true
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      horizontalPadding: Style.spacing.md
-                      verticalPadding: Style.spacing.xxs
-                      text: "Change"
-                    }
-
-                    Button {
-                      anchors.fill: parent
-                      visible: fieldRow.modelData.action !== ""
-                      bordered: true
-                      foreground: root.foreground
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      horizontalPadding: Style.spacing.md
-                      verticalPadding: Style.spacing.xxs
-                      text: fieldRow.modelData.actionText
-                      tooltipText: fieldRow.modelData.action === "shortcut"
-                        ? "Bind a key combination that opens this plugin  (s)"
-                        : "Put an entry for it in the Omarchy menu  (m)"
-                      onClicked: fieldRow.modelData.action === "shortcut" ? root.askBind() : root.askMenu()
-                    }
-                  }
-
                   Text {
                     width: detailsColumn.width - root.labelWidth - Style.spacing.lg
-                           - (fieldSlot.visible ? fieldSlot.width + Style.spacing.lg : 0)
-                    anchors.verticalCenter: fieldRow.modelData.slot ? parent.verticalCenter : undefined
                     wrapMode: Text.WrapAnywhere
                     textFormat: Text.PlainText
                     text: fieldRow.modelData.value
-                    color: fieldRow.modelData.value === "none" ? root.muted : root.foreground
+                    color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
+                  }
+                }
+              }
+
+              // Shortcut and menu, apart from the facts above: what there is,
+              // and the buttons that manage it.
+              Rectangle {
+                width: parent.width
+                height: 1
+                color: root.faint
+                visible: openersRepeater.count > 0
+              }
+
+              Repeater {
+                id: openersRepeater
+                model: root.openers(root.current)
+
+                Item {
+                  id: openerRow
+                  required property var modelData
+                  width: detailsColumn.width
+                  height: Math.max(openerText.implicitHeight, openerButtons.implicitHeight)
+
+                  Column {
+                    id: openerText
+                    anchors.left: parent.left
+                    anchors.right: openerButtons.left
+                    anchors.rightMargin: Style.spacing.lg
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.spacing.xxs
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: openerRow.modelData.title
+                      color: root.muted
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Repeater {
+                      model: openerRow.modelData.lines
+
+                      Text {
+                        required property string modelData
+                        width: openerText.width
+                        wrapMode: Text.WrapAnywhere
+                        textFormat: Text.PlainText
+                        text: modelData
+                        color: modelData === "none" ? root.muted : root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                      }
+                    }
+                  }
+
+                  Row {
+                    id: openerButtons
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.spacing.controlGap
+
+                    Repeater {
+                      model: openerRow.modelData.actions
+
+                      Button {
+                        required property var modelData
+                        bordered: true
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        horizontalPadding: Style.spacing.md
+                        verticalPadding: Style.spacing.xxs
+                        text: modelData.text
+                        tooltipText: modelData.tip
+                        onClicked: root.openerAction(modelData.kind)
+                      }
+                    }
                   }
                 }
               }
