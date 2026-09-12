@@ -71,6 +71,8 @@ Item {
   property bool binding: false
   property var keyCheck: null
   property string keyMode: ""
+  property var keySuggestions: []
+  property bool showSuggestions: false
 
   // The menu dialog: where in the Omarchy menu the entry goes. Setup › Plugins
   // first, as the place for them; the rest are the menu's top-level sections.
@@ -711,6 +713,8 @@ Item {
       return
     }
     root.keyCheck = null
+    root.keySuggestions = []
+    root.showSuggestions = false
     bindField.text = ""
     root.binding = true
     Qt.callLater(function() { bindField.forceActiveFocus() })
@@ -723,6 +727,22 @@ Item {
     keyCatcher.forceActiveFocus()
   }
 
+  // Free combinations to pick from, beside typing one. They come with the
+  // proposal when the dialog opens, and are asked for again here should
+  // typing have cut that short.
+  function toggleSuggestions() {
+    root.showSuggestions = !root.showSuggestions
+    if (root.showSuggestions && root.keySuggestions.length === 0 && root.current)
+      root.runKeys(["suggest-key", root.current.id], "suggestions")
+    bindField.forceActiveFocus()
+  }
+
+  // Filling the field sets off the same check as typing.
+  function pickSuggestion(keys) {
+    bindField.text = keys
+    bindField.forceActiveFocus()
+  }
+
   function runKeys(args, mode) {
     keyProc.running = false
     root.keyMode = mode
@@ -732,9 +752,13 @@ Item {
 
   function applyKeys(text) {
     var payload = root.parseJson(text)
-    if (root.keyMode === "suggest") {
+    if (root.keyMode === "suggest" || root.keyMode === "suggestions") {
+      root.keySuggestions = payload && payload.suggestions ? payload.suggestions : []
       // Setting the text sets off the check of what was suggested.
-      if (payload && payload.ok && payload.keys && bindField.text === "") bindField.text = payload.keys
+      if (root.keyMode === "suggest" && payload && payload.ok && payload.keys && bindField.text === "")
+        bindField.text = payload.keys
+      // Asking for suggestions may have cut a check short: check again.
+      else if (bindField.text.trim() && !root.keyCheck) keyCheckTimer.restart()
       return
     }
     root.keyCheck = payload
@@ -2493,9 +2517,54 @@ Item {
               font.pixelSize: Style.font.caption
             }
 
+            // Free combinations to pick from, beside typing one.
+            Flow {
+              width: parent.width
+              visible: root.showSuggestions
+              spacing: Style.spacing.sm
+
+              Text {
+                visible: root.keySuggestions.length === 0
+                textFormat: Text.PlainText
+                text: keyProc.running && root.keyMode !== "check" ? "Looking …"
+                  : "None of the usual combinations is free; type one"
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Repeater {
+                model: root.keySuggestions
+
+                Button {
+                  required property string modelData
+                  bordered: true
+                  selected: bindField.text.trim() === modelData
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  horizontalPadding: Style.spacing.md
+                  verticalPadding: Style.spacing.xxs
+                  text: modelData
+                  onClicked: root.pickSuggestion(modelData)
+                }
+              }
+            }
+
             Item {
               width: parent.width
               height: bindButtons.implicitHeight
+
+              Button {
+                anchors.left: parent.left
+                bordered: true
+                active: root.showSuggestions
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                text: "Suggestions"
+                tooltipText: "Free combinations made from the plugin's name"
+                onClicked: root.toggleSuggestions()
+              }
 
               Row {
                 id: bindButtons

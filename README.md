@@ -179,12 +179,14 @@ background has nothing to open, and a disabled one has to be enabled first.
 
 ### Giving a plugin a shortcut
 
-`s`, or **Shortcut…**, proposes a free combination made from the plugin's
-name. It tries the initials first, then the other letters, each with
-`SUPER + ALT`, `SUPER + CTRL`, `SUPER + CTRL + SHIFT` and `SUPER + SHIFT + ALT`.
-Type over it if you want something else. The dialog checks what you type
-against Hyprland as you go: a combination that is free says so, and one that
-is taken says by what. Saving a taken one takes it over, unbinding it first.
+`s`, or **Add**/**Change** beside the shortcut in the details, proposes a free
+combination made from the plugin's name. It tries the initials first, then the
+other letters, each with `SUPER + ALT`, `SUPER + CTRL`, `SUPER + CTRL + SHIFT`
+and `SUPER + SHIFT + ALT`. Type over it if you want something else, or press
+**Suggestions** for the next free ones made the same way, twelve at most, and
+pick one. The dialog checks what you type or pick against Hyprland as you go:
+a combination that is free says so, and one that is taken says by what.
+Saving a taken one takes it over, unbinding it first.
 
 The shortcut runs the same command as Open, and is written to
 `~/.config/hypr/bindings.lua` as a block with its own comment:

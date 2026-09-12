@@ -489,9 +489,12 @@ git -C "$PLUGINS/test.alpha" reset -q --hard "$after"
 # ------------------------------------------------------------- shortcuts
 out=$("$PM" suggest-key test.kappa)
 check "a suggestion starts from the plugin's initials" '.ok == true and .keys == "SUPER + ALT + T"' "$out"
+check "more suggestions come with it, the proposal first, twelve at most" \
+  '.suggestions[0] == .keys and (.suggestions | length) > 1 and (.suggestions | length) <= 12 and (.suggestions | unique | length) == (.suggestions | length)' "$out"
 echo '[{"modmask": 65, "key": "A", "description": "Alpha thing"}, {"modmask": 72, "key": "T", "description": "Terminal thing"}]' >"$HYPR_BINDS"
 out=$("$PM" suggest-key test.kappa)
 check "a suggestion skips a combination that is taken" '.keys == "SUPER + CTRL + T"' "$out"
+check "and so do the other suggestions" 'all(.suggestions[]; . != "SUPER + ALT + T")' "$out"
 echo '[{"modmask": 65, "key": "A", "description": "Alpha thing"}]' >"$HYPR_BINDS"
 
 out=$("$PM" keycheck "super+shift+a")

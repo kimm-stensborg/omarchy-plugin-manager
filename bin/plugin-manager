@@ -775,7 +775,8 @@ cmd_keycheck() {
 
 # suggest-key <id> -- the first free combination made from the plugin's name:
 # its initials first, then its other letters, each tried with the modifiers
-# Omarchy leaves mostly free.
+# Omarchy leaves mostly free. `suggestions` holds the first twelve free ones,
+# in the same order, for the dialog to offer.
 cmd_suggest_key() {
   local id="${1:-}"
   require_managed "$id"
@@ -790,8 +791,8 @@ cmd_suggest_key() {
         | ($c | keylabel) as $label
         | select((takenby($live; $c) | length) == 0 or $label == $own)
         | $label ] as $free
-    | if ($free | length) > 0 then {ok: true, keys: $free[0]}
-      else {ok: false, message: "None of the usual combinations is free; type one"} end'
+    | if ($free | length) > 0 then {ok: true, keys: $free[0], suggestions: $free[0:12]}
+      else {ok: false, message: "None of the usual combinations is free; type one", suggestions: []} end'
 }
 
 # The file without the block the manager looks after for <id> -- one it made,
