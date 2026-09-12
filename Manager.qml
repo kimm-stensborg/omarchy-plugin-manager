@@ -851,11 +851,14 @@ Item {
           var note = (s.description || "").trim()
           return { keys: s.keys.split(" + "),
                    note: many || note.toLowerCase() !== (p.name || "").toLowerCase() ? note : "",
+                   override: s.addedBy === "manager",
                    inactive: s.active === false }
         }),
         actions: actions(root.managedShortcut(p), "shortcut", "shortcut") },
       { title: "Menu",
-        lines: opens.menu.map(function(m) { return { path: m.path.split(" › ") } }),
+        lines: opens.menu.map(function(m) {
+          return { path: m.path.split(" › "), override: m.addedBy === "manager" }
+        }),
         actions: actions(root.managedMenu(p), "menu", "menu entry") }
     ]
     return rows.filter(function(r) { return canOpen || r.lines.length > 0 })
@@ -1702,6 +1705,27 @@ Item {
                             color: root.muted
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.bodySmall
+                          }
+
+                          // Set from the manager, in place of what the plugin set.
+                          Rectangle {
+                            visible: openerLine.modelData.override === true
+                            width: overrideText.implicitWidth + Style.spacing.md * 2
+                            height: root.tagHeight
+                            radius: height / 2
+                            color: Util.alpha(root.foreground, 0.08)
+                            border.width: 1
+                            border.color: Util.alpha(root.foreground, 0.25)
+
+                            Text {
+                              id: overrideText
+                              anchors.centerIn: parent
+                              textFormat: Text.PlainText
+                              text: "override"
+                              color: root.muted
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
+                            }
                           }
 
                           Rectangle {
