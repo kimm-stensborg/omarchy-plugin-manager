@@ -937,7 +937,9 @@ Item {
   function fields(p) {
     var list = []
     if (!p) return list
-    function add(label, value) { if (value) list.push({ label: label, value: String(value) }) }
+    function add(label, value, action, actionText) {
+      if (value) list.push({ label: label, value: String(value), action: action || "", actionText: actionText || "" })
+    }
     add("Id", p.id)
     if (p.manifestId && p.manifestId !== p.id) add("Manifest id", p.manifestId)
     add("Author", p.author)
@@ -946,16 +948,26 @@ Item {
     add("Status", p.enabled ? "enabled" : "disabled")
     // How it opens: its shortcuts, menu entries and place in the bar. With
     // none of those, the command the Open button runs.
+    // The Shortcut and Menu lines carry the small button that opens their
+    // dialog: on the line set here when there is one, since saving moves it,
+    // else on the first; with neither, on a line saying so.
     var opens = p.opens || { shortcuts: [], menu: [], bar: [] }
+    var canOpen = !!p.openCommand
+    var ownKey = opens.shortcuts.findIndex(function(s) { return s.managed })
     for (var i = 0; i < opens.shortcuts.length; i++) {
       var s = opens.shortcuts[i]
       add("Shortcut", s.keys + (s.description ? "  ·  " + s.description : "")
                       + (s.managed ? "  (set here)" : "")
-                      + (s.active === false ? "  (not active)" : ""))
+                      + (s.active === false ? "  (not active)" : ""),
+          canOpen && i === Math.max(ownKey, 0) ? "shortcut" : "", ownKey >= 0 ? "Change" : "Add")
     }
+    if (canOpen && opens.shortcuts.length === 0) add("Shortcut", "none", "shortcut", "Add")
+    var ownEntry = opens.menu.findIndex(function(m) { return m.managed && m.addedBy !== "plugin" })
     for (var j = 0; j < opens.menu.length; j++)
       add("Menu", opens.menu[j].path + (!opens.menu[j].managed ? ""
-                  : opens.menu[j].addedBy === "plugin" ? "  (added by the plugin)" : "  (set here)"))
+                  : opens.menu[j].addedBy === "plugin" ? "  (added by the plugin)" : "  (set here)"),
+          canOpen && j === Math.max(ownEntry, 0) ? "menu" : "", ownEntry >= 0 ? "Change" : "Add")
+    if (canOpen && opens.menu.length === 0) add("Menu", "none", "menu", "Add")
     for (var k = 0; k < opens.bar.length; k++) add("Bar", opens.bar[k].section + " section")
     if (opens.shortcuts.length + opens.menu.length + opens.bar.length === 0) add("Opens with", p.openCommand)
     if (p.rollback)
@@ -1518,6 +1530,7 @@ Item {
 
                   Text {
                     width: root.labelWidth
+                    anchors.verticalCenter: fieldAction.visible ? fieldAction.verticalCenter : undefined
                     textFormat: Text.PlainText
                     text: fieldRow.modelData.label
                     color: root.muted
@@ -1527,12 +1540,31 @@ Item {
 
                   Text {
                     width: detailsColumn.width - root.labelWidth - Style.spacing.lg
+                           - (fieldAction.visible ? fieldAction.width + Style.spacing.lg : 0)
+                    anchors.verticalCenter: fieldAction.visible ? fieldAction.verticalCenter : undefined
                     wrapMode: Text.WrapAnywhere
                     textFormat: Text.PlainText
                     text: fieldRow.modelData.value
-                    color: root.foreground
+                    color: fieldRow.modelData.value === "none" ? root.muted : root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
+                  }
+
+                  // Opens the shortcut or menu dialog for this line.
+                  Button {
+                    id: fieldAction
+                    visible: fieldRow.modelData.action !== ""
+                    bordered: true
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    horizontalPadding: Style.spacing.md
+                    verticalPadding: Style.spacing.xxs
+                    text: fieldRow.modelData.actionText
+                    tooltipText: fieldRow.modelData.action === "shortcut"
+                      ? "Bind a key combination that opens this plugin  (s)"
+                      : "Put an entry for it in the Omarchy menu  (m)"
+                    onClicked: fieldRow.modelData.action === "shortcut" ? root.askBind() : root.askMenu()
                   }
                 }
               }
@@ -1621,26 +1653,6 @@ Item {
               text: "Read"
               tooltipText: "Its files, what can run, and its README  (i)"
               onClicked: root.inspectCurrent()
-            }
-
-            Button {
-              visible: root.current !== null
-              bordered: true
-              foreground: root.current && root.current.openCommand ? root.foreground : root.muted
-              fontFamily: root.fontFamily
-              text: "Menu…"
-              tooltipText: "Put an entry for it in the Omarchy menu  (m)"
-              onClicked: root.askMenu()
-            }
-
-            Button {
-              visible: root.current !== null
-              bordered: true
-              foreground: root.current && root.current.openCommand ? root.foreground : root.muted
-              fontFamily: root.fontFamily
-              text: "Shortcut…"
-              tooltipText: "Bind a key combination that opens this plugin  (s)"
-              onClicked: root.askBind()
             }
 
             Button {
