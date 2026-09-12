@@ -407,7 +407,7 @@ check "a shortcut Hyprland does not have is found but not live" \
 check "a shortcut written by hand is not the manager's" \
   '.plugins[] | select(.id == "test.alpha") | .opens.shortcuts[0].managed == false' "$out"
 check "a menu entry that runs a plugin's own script is found, with its path" \
-  '.plugins[] | select(.id == "test.kappa") | .opens.menu == [{path: "Setup › Plugins › Kappa", action: "kappa-open now"}]' "$out"
+  '.plugins[] | select(.id == "test.kappa") | .opens.menu | map({path, action}) == [{path: "Setup › Plugins › Kappa", action: "kappa-open now"}]' "$out"
 check "a plugin's place in the bar is listed" '.plugins[] | select(.id == "test.alpha") | .opens.bar == [{section: "right"}]' "$out"
 check "a binding for something else belongs to no plugin" \
   'all(.plugins[]; all(.opens.shortcuts[]; .description != "Browser"))' "$out"
@@ -542,6 +542,81 @@ out=$("$PM" unbind test.kappa)
 check "unbinding what the manager did not make is refused" '.ok == false' "$out"
 out=$("$PM" unbind test.alpha)
 check "a binding written by hand cannot be unbound here" '.ok == false' "$out"
+
+# ------------------------------------------------------------------ menu
+MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+# Whether a file still reads as JSONC: comments out (outside strings),
+# trailing commas out, then parsed as JSON.
+jsonc_ok() {
+  python3 - "$1" <<'PY'
+import json, re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+out, i, n, in_str = [], 0, len(text), False
+while i < n:
+    c = text[i]
+    if in_str:
+        out.append(c)
+        if c == "\\":
+            out.append(text[i + 1:i + 2]); i += 2; continue
+        if c == '"':
+            in_str = False
+        i += 1; continue
+    if c == '"':
+        in_str = True; out.append(c); i += 1; continue
+    if text.startswith("//", i):
+        j = text.find("\n", i); i = n if j < 0 else j; continue
+    out.append(c); i += 1
+json.loads(re.sub(r",(\s*[}\]])", r"\1", "".join(out)))
+PY
+}
+MARK_KAPPA="  // test.kappa name (test.kappa), added by Plugin Manager"
+
+out=$("$PM" menu-add test.kappa)
+check "an entry goes under Setup › Plugins by default, beside the entry already there" \
+  '.ok == true and .entry == "setup.plugin.kappa-plugin" and .path == "Setup › Plugins › test.kappa name"' "$out"
+holds "the entry is written below its comment" \
+  "grep -A1 -xF -- '$MARK_KAPPA' \"\$MENU\" | grep -qF '\"setup.plugin.kappa-plugin\":'"
+holds "the entry runs what Open runs, and gets an alias" \
+  "grep -F '\"setup.plugin.kappa-plugin\"' \"\$MENU\" | grep -F '\"action\":\"kappa-open now\"' | grep -qF '\"aliases\":[\"kappa\"]'"
+holds "the entry that was there is left alone" \
+  'grep -qF "\"setup.plugin.kappa\": {\"icon\":\"x\",\"label\":\"Kappa\",\"action\":\"kappa-open now\"}" "$MENU"'
+holds "the file still reads as JSONC" 'jsonc_ok "$MENU"'
+out=$("$PM" list)
+check "the list knows the manager made it" \
+  '.plugins[] | select(.id == "test.kappa") | any(.opens.menu[]; .entry == "setup.plugin.kappa-plugin" and .managed and .label == "test.kappa name")' "$out"
+check "and that it did not make the one that was there" \
+  '.plugins[] | select(.id == "test.kappa") | any(.opens.menu[]; .entry == "setup.plugin.kappa" and (.managed | not))' "$out"
+
+out=$("$PM" menu-add test.alpha --parent apps --label "Alpha" --icon "A" --description "")
+check "a place, label and icon can be chosen" '.ok == true and .entry == "apps.alpha" and .path == "Apps › Alpha"' "$out"
+holds "an empty description is left out" "! grep -F '\"apps.alpha\"' \"\$MENU\" | grep -qF description"
+"$PM" menu-add test.alpha --parent system --label "Alpha" >/dev/null
+holds "adding again moves the entry rather than adding a second" \
+  '[[ $(grep -c "(test.alpha), added by Plugin Manager" "$MENU") == 1 ]] && grep -qF "\"system.alpha\"" "$MENU" && ! grep -qF "\"apps.alpha\"" "$MENU"'
+out=$("$PM" menu-add test.alpha --parent nowhere)
+check "a place the menu does not have is refused" '.ok == false' "$out"
+out=$("$PM" menu-add test.theta)
+check "a plugin with nothing to open gets no entry" '.ok == false and (.message | test("nothing to put in the menu"))' "$out"
+out=$("$PM" menu-add test.beta)
+check "a plugin that is not git gets no entry" '.ok == false and (.message | test("not a git plugin"))' "$out"
+holds "the file still reads as JSONC" 'jsonc_ok "$MENU"'
+
+# The entry before the new one without its comma, as a hand edit can leave it.
+cp "$MENU" "$SANDBOX/menu.keep"
+printf '{\n  "apps.x": {"label":"X","action":"true"}\n}\n' >"$MENU"
+out=$("$PM" menu-add test.kappa)
+check "an entry lands after one that lacked its comma" '.ok == true' "$out"
+holds "and the comma is put in, so the file still reads" 'jsonc_ok "$MENU" && grep -qxF "  \"apps.x\": {\"label\":\"X\",\"action\":\"true\"}," "$MENU"'
+cp "$SANDBOX/menu.keep" "$MENU"
+
+out=$("$PM" menu-remove test.alpha)
+check "menu-remove succeeds" '.ok == true' "$out"
+holds "it takes out the comment and the entry, and nothing else" \
+  '! grep -qF "(test.alpha), added by Plugin Manager" "$MENU" && ! grep -qF "\"system.alpha\"" "$MENU" && grep -qF "\"setup.plugin.kappa-plugin\"" "$MENU" && grep -qF "\"setup.plugin.kappa\":" "$MENU"'
+holds "the file still reads as JSONC" 'jsonc_ok "$MENU"'
+out=$("$PM" menu-remove test.alpha)
+check "removing an entry the manager did not make is refused" '.ok == false' "$out"
+"$PM" menu-remove test.kappa >/dev/null
 
 # ------------------------------------------------------------------- run
 export PLUGIN_MANAGER_NO_SUMMON=1

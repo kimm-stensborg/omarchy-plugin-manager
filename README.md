@@ -64,6 +64,7 @@ omarchy-shell shell toggle io.github.kimm-stensborg.plugin-manager '{}'
 | `⏎` | open the selected plugin |
 | `i` | read it: its files, what can run, its README |
 | `s` | give it a shortcut, or change or remove the one it has |
+| `m` | put it in the Omarchy menu, or move or remove the entry it has |
 | `c` | check the selected plugin for an update |
 | `C` | check every plugin |
 | `u` | review its update, then install it |
@@ -196,6 +197,39 @@ it was and nothing is kept. The comment is how the manager finds its own
 blocks again, so it can move a shortcut or remove it (**Remove shortcut**).
 It never edits a binding it did not write.
 
+### Putting a plugin in the menu
+
+`m`, or **Menu…**, puts an entry for the plugin into the Omarchy menu. It
+goes under *Setup › Plugins* unless you pick another place: the top level,
+*Apps*, *Setup*, *System* or *Trigger*. The label, description and icon start
+out as the plugin's own name, description and the puzzle glyph, and a preview
+shows where the entry will appear.
+
+The entry runs the same command as Open. It also gets a short alias, so
+`omarchy menu summon <alias>` opens it as well, unless something else already
+has that alias. It is written to
+`~/.config/omarchy/extensions/omarchy-menu.jsonc` as one line under its own
+comment:
+
+```jsonc
+// Default Applications (io.github.kimm-stensborg.default-apps), added by Plugin Manager
+"setup.plugin.default-apps": {"icon":"󰐱","label":"Default Applications","aliases":["default-apps"],"action":"omarchy-shell shell toggle io.github.kimm-stensborg.default-apps '{}'"},
+```
+
+That file is Omarchy's own place for extending the menu, and the menu reloads
+it when it changes; the menu Omarchy ships is never touched. Rules the
+manager keeps to:
+
+- **It never reuses an id.** In that file, reusing an id overrides the entry
+  that has it, Omarchy's own included. So when the natural id is already
+  taken, by the defaults, by you or by another plugin, the manager picks the
+  next free one.
+- **It checks the file before keeping it.** The file is read back as JSONC
+  after every change, and put back as it was if it does not read. A missing
+  comma on the entry before the new one is added.
+- **It only touches its own entries.** It can move an entry it wrote, or take
+  it out (**Remove entry**). It never edits one it did not write.
+
 ## Export and import
 
 `x` writes every plugin to `~/omarchy-plugins-<host>-<date>.json`. Copy that
@@ -241,10 +275,10 @@ bin/plugin-manager import <file>
 
 The backend prints one JSON document per command: `list`, `check`, `review`,
 `inspect`, `update`, `rollback`, `remove`, `add`, `enable`, `disable`,
-`suggest-key`, `keycheck`, `bind`, `unbind`, `export` and `import`
-(`--help` lists them). The actions wrap the stock `omarchy-plugin-*`
-commands, so cloning, validation and rescans work exactly as they do from the
-terminal.
+`suggest-key`, `keycheck`, `bind`, `unbind`, `menu-add`, `menu-remove`,
+`export` and `import` (`--help` lists them). The actions wrap the stock
+`omarchy-plugin-*` commands, so cloning, validation and rescans work exactly
+as they do from the terminal.
 
 Those commands finish by rescanning the shell, and a rescan unloads every open
 panel, this one included. So the overlay does not wait on them. It starts
@@ -257,8 +291,8 @@ panel, this one included. So the overlay does not wait on them. It starts
 The manager is gone for a second or two while the shell rebuilds its panels;
 no plugin can stay on screen through that.
 
-Checks, reviews, reads, exports, import previews and shortcut changes do not
-rescan, so they run directly.
+Checks, reviews, reads, exports, import previews, shortcut changes and menu
+changes do not rescan, so they run directly.
 
 ## Remove
 

@@ -19,6 +19,8 @@
 #   plugin-manager keycheck <keys> [id]
 #   plugin-manager bind <id> <keys> [--replace]
 #   plugin-manager unbind <id>
+#   plugin-manager menu-add <id> [--parent P] [--label L] [--description D] [--icon G]
+#   plugin-manager menu-remove <id>
 #   plugin-manager export [file]
 #   plugin-manager import <file> [--dry-run]
 #   plugin-manager run --label L --id ID --kind K -- <command...>
@@ -231,7 +233,12 @@ BINDINGS="$HYPR_DIR/bindings.lua"
 BINDINGS_BACKUP="$HYPR_DIR/bindings.lua.plugin-manager.bak"
 MENU_DEFAULTS="${OMARCHY_PATH:-/usr/share/omarchy}/default/omarchy/omarchy-menu.jsonc"
 MENU_USER="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+MENU_BACKUP="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc.plugin-manager.bak"
 BIND_MARK="bound by Plugin Manager"
+MENU_MARK="added by Plugin Manager"
+# Where a menu entry may go: Setup › Plugins first, then the menu's top level
+# ("") and its top-level sections.
+MENU_PARENTS=("setup.plugin" "" "apps" "setup" "system" "trigger")
 
 # [{keys, description, command, file, line}] for every o.bind line. A line
 # commented out does not start with o.bind, so it does not count.
@@ -271,16 +278,46 @@ live_binds_json() {
   fi
 }
 
-# Every menu entry as {id: entry}, the user's extension merged over the
-# defaults the way the menu merges them. Both files keep one entry per line,
-# which is what lets them be read here without a JSONC parser.
-menu_entries_json() {
-  cat "$MENU_DEFAULTS" "$MENU_USER" 2>/dev/null | jq -Rsc '
+# Every menu entry in the given files as {id: entry}, later files merged over
+# earlier ones the way the menu merges your extension over its defaults. Both
+# files keep one entry per line, which is what lets them be read here without
+# a JSONC parser.
+menu_entries_from() {
+  cat "$@" 2>/dev/null | jq -Rsc '
     [ split("\n")[]
       | capture("^\\s*\"(?<id>[^\"]+)\"\\s*:\\s*(?<entry>\\{.*\\})\\s*,?\\s*$")
       | .entry |= (try fromjson catch null)
       | select(.entry | type == "object") ]
     | reduce .[] as $e ({}; .[$e.id] = ((.[$e.id] // {}) + $e.entry))'
+}
+
+menu_entries_json() {
+  menu_entries_from "$MENU_DEFAULTS" "$MENU_USER"
+}
+
+# [{plugin, entry}] for every menu entry the manager wrote: the entry on the
+# line after its comment.
+menu_markers_json() {
+  [[ -f $MENU_USER ]] || {
+    echo '[]'
+    return
+  }
+  awk -v mark="$MENU_MARK" '
+    pending != "" {
+      if (match($0, /^[[:space:]]*"[^"]+"[[:space:]]*:/)) {
+        key = substr($0, RSTART, RLENGTH)
+        sub(/^[[:space:]]*"/, "", key)
+        sub(/"[[:space:]]*:$/, "", key)
+        printf "%s\t%s\n", pending, key
+      }
+      pending = ""
+    }
+    /^[[:space:]]*\/\/ / && index($0, "), " mark) > 0 && substr($0, length($0) - length(mark) + 1) == mark {
+      s = $0
+      sub(/.*\(/, "", s)
+      sub(/\), [^)]*$/, "", s)
+      pending = s
+    }' "$MENU_USER" | jq -Rsc '[split("\n")[] | select(length > 0) | split("\t") | {plugin: .[0], entry: .[1]}]'
 }
 
 cmd_list() {
@@ -302,6 +339,7 @@ cmd_list() {
   printf '%s\n' "${items[@]}" | jq -cs --argjson shell "$shell_plugins" --argjson cache "$cache" \
     --argjson binds "$(config_binds_json)" --argjson markers "$(bind_markers_json)" \
     --argjson live "$(live_binds_json)" --argjson menu "$(menu_entries_json)" \
+    --argjson menuMarks "$(menu_markers_json)" \
     --argjson config "$config" --arg braces "'{}'" "$JQ_KEYS"'
     def eid: if type == "object" then (.id // "") else tostring end;
     def esc: gsub("(?<c>[.*+?^$()\\[\\]{}|\\\\])"; "\\\(.c)");
@@ -337,7 +375,10 @@ cmd_list() {
                                             and ($b.line - .line) >= 1 and ($b.line - .line) <= 2)} ] as $shortcuts
         | [ $menu | to_entries[]
             | select((.value.action | type) == "string" and (.value.action | mentions($p)))
-            | {path: menupath(.key), action: .value.action} ] as $entries
+            | .key as $k
+            | {path: menupath($k), action: .value.action, entry: $k,
+               label: (.value.label // ""), icon: (.value.icon // ""), description: (.value.description // ""),
+               managed: any($menuMarks[]; .plugin == $p.id and .entry == $k)} ] as $entries
         | [ ("left", "center", "right") as $section
             | (($config.bar.layout // {})[$section] // [])[]
             | select(eid == $p.id)
@@ -841,6 +882,217 @@ cmd_unbind() {
   reply true "Removed the shortcut for $name" "" "$(jq -cn --arg id "$id" '{id: $id}')"
 }
 
+# ------------------------------------------------------------------ menu
+
+# A menu entry the manager makes is one line in the user's menu extension,
+# ~/.config/omarchy/extensions/omarchy-menu.jsonc, under a comment:
+#
+#   // Default Applications (io.github.kimm-stensborg.default-apps), added by Plugin Manager
+#   "setup.plugin.default-apps": {"icon":"…","label":"Default Applications","aliases":["default-apps"],"action":"…"},
+#
+# That file is Omarchy's own place for extending the menu, and the menu reloads
+# it when it changes. The defaults it is merged over are never touched. An id
+# that is already in use -- in the defaults, by you or by another plugin -- is
+# never written, since writing one overrides that entry; the manager picks the
+# next free one. The comment is how it finds its own entries again, and it
+# never moves or removes an entry it did not write.
+
+# The file without the manager's entry for <id>, and without the blank line
+# before its comment; exits 3 when there was none.
+strip_menu_block() {
+  awk -v id="$1" -v mark="$MENU_MARK" '
+    skip {
+      skip = 0
+      if ($0 ~ /^[[:space:]]*"[^"]+"[[:space:]]*:/) next
+    }
+    /^[[:space:]]*\/\/ / && index($0, "(" id "), " mark) > 0 && substr($0, length($0) - length(mark) + 1) == mark {
+      skip = 1
+      found = 1
+      if (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+      next
+    }
+    { lines[++n] = $0 }
+    END {
+      for (i = 1; i <= n; i++) print lines[i]
+      exit(found ? 0 : 3)
+    }' "$2"
+}
+
+# insert_menu_entry <file> <comment-line> <entry-line> -- the file with the two
+# lines just before its closing brace. The entry before them gets the comma it
+# needs, should a hand edit have left it off. Exits 4 without a closing brace.
+insert_menu_entry() {
+  awk -v comment="$2" -v entry="$3" '
+    { lines[++n] = $0 }
+    END {
+      last = n
+      while (last > 0 && lines[last] !~ /^[[:space:]]*}[[:space:]]*$/) last--
+      if (last == 0) exit 4
+      for (i = last - 1; i > 0; i--) {
+        if (lines[i] ~ /^[[:space:]]*$/ || lines[i] ~ /^[[:space:]]*\/\//) continue
+        if (lines[i] !~ /[,{][[:space:]]*$/) lines[i] = lines[i] ","
+        break
+      }
+      for (i = 1; i < last; i++) print lines[i]
+      if (last > 1 && lines[last - 1] !~ /^[[:space:]]*$/) print ""
+      print comment
+      print entry
+      for (i = last; i <= n; i++) print lines[i]
+    }' "$1"
+}
+
+# Whether a file reads as JSONC: comments out (outside strings), trailing
+# commas out, then parsed as JSON. Without python3 there is nothing to check
+# with, and the file is taken on trust.
+jsonc_valid() {
+  command -v python3 >/dev/null || return 0
+  python3 - "$1" 2>/dev/null <<'PY'
+import json, re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+out, i, n, in_str = [], 0, len(text), False
+while i < n:
+    c = text[i]
+    if in_str:
+        out.append(c)
+        if c == "\\":
+            out.append(text[i + 1:i + 2]); i += 2; continue
+        if c == '"':
+            in_str = False
+        i += 1; continue
+    if c == '"':
+        in_str = True; out.append(c); i += 1; continue
+    if text.startswith("//", i):
+        j = text.find("\n", i); i = n if j < 0 else j; continue
+    if text.startswith("/*", i):
+        j = text.find("*/", i + 2); i = n if j < 0 else j + 2; continue
+    out.append(c); i += 1
+json.loads(re.sub(r",(\s*[}\]])", r"\1", "".join(out)))
+PY
+}
+
+# menu-add <id> [--parent P] [--label L] [--description D] [--icon G] -- an
+# entry for the plugin that runs what Open runs, under Setup › Plugins unless
+# told otherwise. Adding again moves the entry the manager made before.
+cmd_menu_add() {
+  local id="" parent="setup.plugin" label="" icon="$PLUGIN_GLYPH" description="" have_description=0
+  while (($# > 0)); do
+    case "$1" in
+    --parent | --label | --icon | --description)
+      (($# >= 2)) || fail "$1 needs a value"
+      case "$1" in
+      --parent) parent="$2" ;;
+      --label) label="$2" ;;
+      --icon) icon="$2" ;;
+      --description)
+        description="$2"
+        have_description=1
+        ;;
+      esac
+      shift 2
+      ;;
+    -*) fail "unknown menu-add option: $1" ;;
+    *)
+      [[ -z $id ]] || fail "unexpected argument: $1"
+      id="$1"
+      shift
+      ;;
+    esac
+  done
+  require_managed "$id"
+  [[ $parent != top ]] || parent=""
+  local place known=0
+  for place in "${MENU_PARENTS[@]}"; do [[ $place == "$parent" ]] && known=1; done
+  ((known)) || fail "the menu has no place called '$parent' to put it; use setup.plugin, top, apps, setup, system or trigger"
+
+  local plugin name command
+  plugin=$(cmd_list | jq -c --arg id "$id" '.plugins[] | select(.id == $id)')
+  name=$(jq -r '.name' <<<"$plugin")
+  command=$(jq -r '.openCommand' <<<"$plugin")
+  [[ -n $command ]] || fail "$name has no window to open, so there is nothing to put in the menu"
+  label="${label//$'\n'/ }"
+  [[ -n ${label// /} ]] || label="$name"
+  ((have_description)) || description=$(jq -r '.description' <<<"$plugin")
+  description="${description//$'\n'/ }"
+  icon="${icon//$'\n'/}"
+  [[ -n $icon ]] || icon="$PLUGIN_GLYPH"
+
+  mkdir -p "$(dirname "$MENU_USER")"
+  [[ -s $MENU_USER ]] || printf '{\n}\n' >"$MENU_USER"
+  cp "$MENU_USER" "$MENU_BACKUP"
+
+  # Out with the entry made before, so moving one cannot collide with itself.
+  local stripped placed
+  stripped=$(mktemp)
+  placed=$(mktemp)
+  strip_menu_block "$id" "$MENU_USER" >"$stripped"
+
+  # An id nothing uses yet, and the short alias `omarchy menu summon` goes by
+  # unless something already has it.
+  local taken slug base key n=2 alias
+  taken=$(menu_entries_from "$MENU_DEFAULTS" "$stripped")
+  slug=$(jq -rn --arg id "$id" '$id | split(".") | last | ascii_downcase | gsub("[^a-z0-9-]+"; "-")')
+  base="${parent:+$parent.}$slug"
+  key="$base"
+  jq -e --arg k "$key" 'has($k)' >/dev/null <<<"$taken" && key="$base-plugin"
+  while jq -e --arg k "$key" 'has($k)' >/dev/null <<<"$taken"; do
+    key="$base-$n"
+    n=$((n + 1))
+  done
+  alias=$(jq -r --arg a "$slug" 'if has($a) or any(.[]; ((.aliases // []) | index($a)) != null) then "" else $a end' <<<"$taken")
+
+  local entry line comment
+  entry=$(jq -cn --arg icon "$icon" --arg label "$label" --arg alias "$alias" \
+    --arg description "$description" --arg action "$command" '
+    {icon: $icon, label: $label}
+    + (if $alias == "" then {} else {aliases: [$alias]} end)
+    + (if $description == "" then {} else {description: $description} end)
+    + {action: $action}')
+  line="  $(jq -cn --arg k "$key" '$k'): $entry,"
+  comment="  // ${name//$'\n'/ } ($id), $MENU_MARK"
+  if ! insert_menu_entry "$stripped" "$comment" "$line" >"$placed"; then
+    rm -f "$stripped" "$placed"
+    fail "the menu file has no closing brace to add an entry before"
+  fi
+  # Written in place, the way the rest of the config is edited.
+  cat "$placed" >"$MENU_USER"
+  rm -f "$stripped" "$placed"
+
+  # Read back as the menu will read it; anything off puts the file back.
+  if ! jsonc_valid "$MENU_USER" ||
+    ! menu_entries_json | jq -e --arg k "$key" --arg a "$command" '.[$k].action == $a' >/dev/null; then
+    cat "$MENU_BACKUP" >"$MENU_USER"
+    fail "the menu file did not read back as it should, so it was left as it was"
+  fi
+
+  local path
+  path=$(menu_entries_json | jq -r --arg k "$key" '
+    . as $menu | $k | split(".") as $parts
+    | [range(1; ($parts | length) + 1) | $parts[0:.] | join(".") | ($menu[.].label // .)]
+    | join(" › ")')
+  reply true "Added $path to the menu" "" \
+    "$(jq -cn --arg id "$id" --arg entry "$key" --arg path "$path" '{id: $id, entry: $entry, path: $path}')"
+}
+
+cmd_menu_remove() {
+  local id="${1:-}" name tmp
+  [[ -n $id ]] && valid_id "$id" || fail "a plugin id is required"
+  name=$(plugin_name "$id")
+  [[ -f $MENU_USER ]] || fail "there is no menu entry the manager made for $name"
+  cp "$MENU_USER" "$MENU_BACKUP"
+  tmp=$(mktemp)
+  if ! strip_menu_block "$id" "$MENU_USER" >"$tmp"; then
+    rm -f "$tmp"
+    fail "there is no menu entry the manager made for $name"
+  fi
+  cat "$tmp" >"$MENU_USER"
+  rm -f "$tmp"
+  if ! jsonc_valid "$MENU_USER"; then
+    cat "$MENU_BACKUP" >"$MENU_USER"
+    fail "the menu file did not read back as it should, so it was left as it was"
+  fi
+  reply true "Took $name out of the menu" "" "$(jq -cn --arg id "$id" '{id: $id}')"
+}
+
 # ---------------------------------------------------------- export/import
 
 # The export is a list of git URLs, so it only carries what another machine can
@@ -1204,6 +1456,8 @@ suggest-key) cmd_suggest_key "$@" ;;
 keycheck) cmd_keycheck "$@" ;;
 bind) cmd_bind "$@" ;;
 unbind) cmd_unbind "$@" ;;
+menu-add) cmd_menu_add "$@" ;;
+menu-remove) cmd_menu_remove "$@" ;;
 export) cmd_export "$@" ;;
 import) cmd_import "$@" ;;
 run) cmd_run "$@" ;;

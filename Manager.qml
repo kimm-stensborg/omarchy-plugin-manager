@@ -8,10 +8,10 @@ import qs.Ui
 // Plugin Manager. Lists the git plugins in ~/.config/omarchy/plugins -- never
 // the built-in omarchy.* ones -- with their details, how each one opens,
 // whether an update is waiting, and the actions to open, read, review and
-// update, roll back, enable, disable, bind a shortcut to, remove or add one.
-// It lists itself too, so it can update itself, but it will not switch itself
-// off or remove itself. Every action runs bin/plugin-manager; this file only
-// renders what comes back.
+// update, roll back, enable, disable, give a shortcut or a menu entry to,
+// remove or add one. It lists itself too, so it can update itself, but it will
+// not switch itself off or remove itself. Every action runs bin/plugin-manager;
+// this file only renders what comes back.
 Item {
   id: root
 
@@ -27,6 +27,7 @@ Item {
   readonly property string backend: root.pluginDir + "/bin/plugin-manager"
   readonly property string stateDir: (Quickshell.env("XDG_CACHE_HOME") || Quickshell.env("HOME") + "/.cache")
     + "/omarchy/plugin-manager"
+  readonly property string pluginGlyph: "󰐱"
   // How old the update check may be before opening the manager redoes it.
   readonly property int staleSeconds: 6 * 3600
 
@@ -40,7 +41,7 @@ Item {
   property bool listedOnce: false
   property bool relistPending: false
 
-  // Update checks, reviews, reads, exports, import previews and shortcut
+  // Update checks, reviews, reads, exports, import previews, shortcut and menu
   // changes run in-process: none of them rescans the shell.
   property string busyLabel: ""
   property string busyId: ""
@@ -70,6 +71,19 @@ Item {
   property bool binding: false
   property var keyCheck: null
   property string keyMode: ""
+
+  // The menu dialog: where in the Omarchy menu the entry goes. Setup › Plugins
+  // first, as the place for them; the rest are the menu's top-level sections.
+  property bool menuing: false
+  property string menuParent: "setup.plugin"
+  readonly property var menuPlaces: [
+    { key: "setup.plugin", label: "Setup › Plugins" },
+    { key: "", label: "Top level" },
+    { key: "apps", label: "Apps" },
+    { key: "setup", label: "Setup" },
+    { key: "system", label: "System" },
+    { key: "trigger", label: "Trigger" }
+  ]
 
   // Everything else runs detached (see `plugin-manager run`), because the
   // stock commands end in a shell rescan that unloads this overlay mid-action.
@@ -162,6 +176,7 @@ Item {
     root.inspection = null
     root.binding = false
     root.keyCheck = null
+    root.menuing = false
   }
 
   // User-initiated closes go through the host so its open-panel state stays in
@@ -227,7 +242,8 @@ Item {
 
   // --------------------------------------------------------------- actions
 
-  readonly property var quickKinds: ["check", "export", "preview", "review", "inspect", "bind", "unbind"]
+  readonly property var quickKinds: ["check", "export", "preview", "review", "inspect", "bind", "unbind",
+                                     "menu", "menuremove"]
 
   // One action at a time: they all end in the stock commands, which rescan
   // the shell and would trip over each other.
@@ -755,6 +771,85 @@ Item {
     return { text: c.keys + " is free", color: root.accent }
   }
 
+  // ------------------------------------------------------------------- menu
+
+  // The menu dialog puts an entry for the plugin into the Omarchy menu, one
+  // that runs what Open runs. The manager only moves and removes the entries
+  // it wrote itself; the backend picks an id nothing else has.
+  function askMenu() {
+    var p = root.current
+    if (!p) return
+    if (!p.openCommand) {
+      root.setStatus(p.name + " has no window to open, so there is nothing to put in the menu", false)
+      return
+    }
+    var own = root.managedMenu(p)
+    root.menuParent = own ? root.parentOf(own.entry) : "setup.plugin"
+    menuLabel.text = own && own.label ? own.label : p.name
+    menuDescription.text = own ? (own.description || "") : (p.description || "")
+    menuIcon.text = own && own.icon ? own.icon : root.pluginGlyph
+    root.menuing = true
+    Qt.callLater(function() { menuLabel.forceActiveFocus() })
+  }
+
+  function closeMenu() {
+    root.menuing = false
+    keyCatcher.forceActiveFocus()
+  }
+
+  function saveMenu() {
+    var p = root.current
+    if (!p) return
+    var label = menuLabel.text.trim()
+    if (!label) {
+      menuLabel.forceActiveFocus()
+      return
+    }
+    var args = ["menu-add", p.id, "--parent", root.menuParent, "--label", label,
+                "--description", menuDescription.text.trim(), "--icon", menuIcon.text.trim() || root.pluginGlyph]
+    root.closeMenu()
+    root.runAction(args, "Adding " + label + " to the menu", p.id, "menu", false)
+  }
+
+  function removeMenu() {
+    var p = root.current
+    if (!p) return
+    root.closeMenu()
+    root.runAction(["menu-remove", p.id], "Taking " + p.name + " out of the menu", p.id, "menuremove", false)
+  }
+
+  function managedMenu(p) {
+    var entries = p && p.opens ? p.opens.menu : []
+    for (var i = 0; i < entries.length; i++) if (entries[i].managed) return entries[i]
+    return null
+  }
+
+  // "setup.plugin.kappa" sits under "setup.plugin"; a top-level id under "".
+  function parentOf(entry) {
+    var parts = String(entry || "").split(".")
+    parts.pop()
+    return parts.join(".")
+  }
+
+  function menuPreview() {
+    var label = menuLabel.text.trim() || "…"
+    for (var i = 0; i < root.menuPlaces.length; i++) {
+      var place = root.menuPlaces[i]
+      if (place.key === root.menuParent) return place.key === "" ? label : place.label + " › " + label
+    }
+    return label
+  }
+
+  function menuKey(event) {
+    if (event.key === Qt.Key_Escape) {
+      root.closeMenu()
+      event.accepted = true
+    } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+      root.saveMenu()
+      event.accepted = true
+    }
+  }
+
   // ------------------------------------------------------------- helpers
 
   function parseJson(text) {
@@ -858,7 +953,8 @@ Item {
                       + (s.managed ? "  (set here)" : "")
                       + (s.active === false ? "  (not active)" : ""))
     }
-    for (var j = 0; j < opens.menu.length; j++) add("Menu", opens.menu[j].path)
+    for (var j = 0; j < opens.menu.length; j++)
+      add("Menu", opens.menu[j].path + (opens.menu[j].managed ? "  (set here)" : ""))
     for (var k = 0; k < opens.bar.length; k++) add("Bar", opens.bar[k].section + " section")
     if (opens.shortcuts.length + opens.menu.length + opens.bar.length === 0) add("Opens with", p.openCommand)
     if (p.rollback)
@@ -889,6 +985,11 @@ Item {
       event.accepted = true
       return
     }
+    if (root.menuing) {
+      if (event.key === Qt.Key_Escape) root.closeMenu()
+      event.accepted = true
+      return
+    }
     if (root.confirmingRemove || root.confirmingImport || root.confirmingRollback) {
       confirm.handleKey(event)
       event.accepted = true
@@ -909,6 +1010,7 @@ Item {
     else if (t === "b") root.askRollback()
     else if (t === "e") root.toggleEnabled()
     else if (t === "s") root.askBind()
+    else if (t === "m") root.askMenu()
     else if (t === "d" || key === Qt.Key_Delete) root.askRemove()
     else if (t === "a" || t === "/") urlField.forceActiveFocus()
     else if (t === "x") root.exportPlugins()
@@ -1525,6 +1627,16 @@ Item {
               bordered: true
               foreground: root.current && root.current.openCommand ? root.foreground : root.muted
               fontFamily: root.fontFamily
+              text: "Menu…"
+              tooltipText: "Put an entry for it in the Omarchy menu  (m)"
+              onClicked: root.askMenu()
+            }
+
+            Button {
+              visible: root.current !== null
+              bordered: true
+              foreground: root.current && root.current.openCommand ? root.foreground : root.muted
+              fontFamily: root.fontFamily
               text: "Shortcut…"
               tooltipText: "Bind a key combination that opens this plugin  (s)"
               onClicked: root.askBind()
@@ -1567,7 +1679,7 @@ Item {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
-            text: "⏎ open  i read  s shortcut  c check  u update  b roll back  e enable  d remove  a add  x export  esc close"
+            text: "⏎ open  i read  s shortcut  m menu  c check  u update  b roll back  e enable  d remove  a add  x export  esc close"
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -2177,6 +2289,233 @@ Item {
                   fontFamily: root.fontFamily
                   text: root.keyCheck && root.keyCheck.ok && root.keyCheck.taken ? "Take over" : "Save"
                   onClicked: root.saveBind()
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // -------------------------------------------------------------- menu
+      // An entry for the plugin in the Omarchy menu: where it goes, what it
+      // says, and a preview of where it will show.
+      Item {
+        id: menuDialog
+        anchors.fill: parent
+        visible: root.menuing
+
+        readonly property var own: root.menuing ? root.managedMenu(root.current) : null
+
+        Rectangle {
+          anchors.fill: parent
+          color: Util.alpha(root.background, 0.7)
+
+          MouseArea {
+            anchors.fill: parent
+            onClicked: root.closeMenu()
+          }
+        }
+
+        BorderSurface {
+          id: menuCard
+          width: Math.min(parent.width - Style.space(32), Style.space(560))
+          height: menuCard.contentTopInset + menuCard.contentBottomInset + menuColumn.implicitHeight
+          anchors.centerIn: parent
+          color: root.background
+          borderSpec: Border.flat(root.accent, Style.normalBorderWidth)
+          padding: Style.space(18)
+          radius: root.cornerRadius
+
+          MouseArea {
+            anchors.fill: parent
+            onClicked: menuLabel.forceActiveFocus()
+          }
+
+          Column {
+            id: menuColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.topMargin: menuCard.contentTopInset
+            anchors.leftMargin: menuCard.contentLeftInset
+            anchors.rightMargin: menuCard.contentRightInset
+            spacing: Style.spacing.lg
+
+            Text {
+              width: parent.width
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              text: root.current ? "Menu entry for " + root.current.name : ""
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+            }
+
+            Text {
+              width: parent.width
+              elide: Text.ElideMiddle
+              textFormat: Text.PlainText
+              text: root.current ? "Runs: " + root.current.openCommand : ""
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.spacing.sm
+
+              Text {
+                textFormat: Text.PlainText
+                text: "Where"
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Flow {
+                width: parent.width
+                spacing: Style.spacing.controlGap
+
+                Repeater {
+                  model: root.menuPlaces
+
+                  Button {
+                    required property var modelData
+                    bordered: true
+                    selected: root.menuParent === modelData.key
+                    foreground: selected ? root.accent : root.foreground
+                    fontFamily: root.fontFamily
+                    text: modelData.label
+                    onClicked: root.menuParent = modelData.key
+                  }
+                }
+              }
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.spacing.lg
+
+              Column {
+                width: parent.width - menuIconColumn.width - Style.spacing.lg
+                spacing: Style.spacing.sm
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "Label"
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                TextField {
+                  id: menuLabel
+                  width: parent.width
+                  foreground: root.foreground
+                  placeholderText: "The name in the menu"
+                  Keys.onPressed: function(event) { root.menuKey(event) }
+                }
+              }
+
+              Column {
+                id: menuIconColumn
+                width: Style.space(72)
+                spacing: Style.spacing.sm
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "Icon"
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                TextField {
+                  id: menuIcon
+                  width: parent.width
+                  foreground: root.foreground
+                  horizontalAlignment: TextInput.AlignHCenter
+                  Keys.onPressed: function(event) { root.menuKey(event) }
+                }
+              }
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.spacing.sm
+
+              Text {
+                textFormat: Text.PlainText
+                text: "Description, shown under the label and searched"
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              TextField {
+                id: menuDescription
+                width: parent.width
+                foreground: root.foreground
+                placeholderText: "Optional"
+                Keys.onPressed: function(event) { root.menuKey(event) }
+              }
+            }
+
+            Text {
+              width: parent.width
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              text: "Shows as: " + root.menuPreview()
+              color: root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+            }
+
+            Text {
+              width: parent.width
+              visible: menuDialog.own !== null
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: menuDialog.own ? "Now: " + menuDialog.own.path + ", added here earlier. Saving moves it." : ""
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Item {
+              width: parent.width
+              height: menuButtons.implicitHeight
+
+              Row {
+                id: menuButtons
+                anchors.right: parent.right
+                spacing: Style.spacing.controlGap
+
+                Button {
+                  visible: menuDialog.own !== null
+                  bordered: true
+                  foreground: root.urgent
+                  fontFamily: root.fontFamily
+                  text: "Remove entry"
+                  onClicked: root.removeMenu()
+                }
+
+                Button {
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  text: "Cancel"
+                  onClicked: root.closeMenu()
+                }
+
+                Button {
+                  bordered: true
+                  foreground: root.accent
+                  fontFamily: root.fontFamily
+                  text: "Save"
+                  onClicked: root.saveMenu()
                 }
               }
             }
