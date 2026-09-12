@@ -970,6 +970,18 @@ json.loads(re.sub(r",(\s*[}\]])", r"\1", "".join(out)))
 PY
 }
 
+# Write new content over the menu extension in place, the way the rest of the
+# config is edited, and then nudge it once more. The menu re-reads the file on
+# every change, and a read that lands between the truncate and the write parses
+# as nothing -- every entry of yours gone from the menu -- with no later change
+# to set it right. The touch a moment later is that change, with the whole file
+# in place.
+write_menu_file() {
+  cat "$1" >"$MENU_USER"
+  sleep 0.3
+  touch "$MENU_USER"
+}
+
 # menu-add <id> [--parent P] [--label L] [--description D] [--icon G] -- an
 # entry for the plugin that runs what Open runs, under Setup › Plugins unless
 # told otherwise. Adding again moves the entry the manager made before.
@@ -1054,13 +1066,13 @@ cmd_menu_add() {
     fail "the menu file has no closing brace to add an entry before"
   fi
   # Written in place, the way the rest of the config is edited.
-  cat "$placed" >"$MENU_USER"
+  write_menu_file "$placed"
   rm -f "$stripped" "$placed"
 
   # Read back as the menu will read it; anything off puts the file back.
   if ! jsonc_valid "$MENU_USER" ||
     ! menu_entries_json | jq -e --arg k "$key" --arg a "$command" '.[$k].action == $a' >/dev/null; then
-    cat "$MENU_BACKUP" >"$MENU_USER"
+    write_menu_file "$MENU_BACKUP"
     fail "the menu file did not read back as it should, so it was left as it was"
   fi
 
@@ -1084,10 +1096,10 @@ cmd_menu_remove() {
     rm -f "$tmp"
     fail "there is no menu entry the manager made for $name"
   fi
-  cat "$tmp" >"$MENU_USER"
+  write_menu_file "$tmp"
   rm -f "$tmp"
   if ! jsonc_valid "$MENU_USER"; then
-    cat "$MENU_BACKUP" >"$MENU_USER"
+    write_menu_file "$MENU_BACKUP"
     fail "the menu file did not read back as it should, so it was left as it was"
   fi
   reply true "Took $name out of the menu" "" "$(jq -cn --arg id "$id" '{id: $id}')"
