@@ -409,8 +409,8 @@ check "a shortcut written by hand is not the manager's" \
   '.plugins[] | select(.id == "test.alpha") | .opens.shortcuts[0].managed == false' "$out"
 check "nor anyone's in particular, a commented-out binding above it notwithstanding" \
   '.plugins[] | select(.id == "test.alpha") | .opens.shortcuts[0].addedBy == null' "$out"
-check "a shortcut under the comment a plugin's install.sh writes is the plugin's, not the manager's" \
-  '.plugins[] | select(.id == "test.kappa") | .opens.shortcuts | map({keys, addedBy, managed}) == [{keys: "SUPER + K", addedBy: "plugin", managed: false}]' "$out"
+check "a shortcut under the comment a plugin's install.sh writes is the plugin's, and looked after" \
+  '.plugins[] | select(.id == "test.kappa") | .opens.shortcuts | map({keys, addedBy, managed}) == [{keys: "SUPER + K", addedBy: "plugin", managed: true}]' "$out"
 check "a menu entry that runs a plugin's own script is found, with its path" \
   '.plugins[] | select(.id == "test.kappa") | .opens.menu | map({path, action}) == [{path: "Setup › Plugins › Kappa", action: "kappa-open now"}]' "$out"
 check "a plugin's place in the bar is listed" '.plugins[] | select(.id == "test.alpha") | .opens.bar == [{section: "right"}]' "$out"
@@ -514,6 +514,8 @@ holds "the binding is written below its comment" \
   "grep -A1 -xF -- '-- test.kappa name (test.kappa), bound by Plugin Manager' \"\$BINDINGS\" | grep -qxF 'o.bind(\"SUPER + ALT + K\", \"test.kappa name\", \"kappa-open now\")'"
 holds "Hyprland is reloaded" 'grep -qx reload "$HYPR_LOG" && grep -qx configerrors "$HYPR_LOG"'
 holds "the bindings written by hand are left alone" 'grep -qF "\"Alpha thing\"" "$BINDINGS" && grep -qF "\"Browser\"" "$BINDINGS"'
+holds "binding moves the plugin's own shortcut rather than adding one" \
+  '! grep -qxF -- "-- Kappa overlay (test.kappa)" "$BINDINGS" && ! grep -qF "\"SUPER + K\"" "$BINDINGS"'
 check "the list knows the manager made it" \
   '.plugins[] | select(.id == "test.kappa") | any(.opens.shortcuts[]; .keys == "SUPER + ALT + K" and .managed and .addedBy == "manager")' "$("$PM" list)"
 out=$("$PM" keycheck "SUPER + ALT + K" test.kappa)
@@ -542,10 +544,14 @@ check "a plugin that is not git gets no binding" '.ok == false and (.message | t
 out=$("$PM" unbind test.kappa)
 check "unbind succeeds" '.ok == true' "$out"
 holds "unbind takes the whole block out" '! grep -qF "(test.kappa), bound by Plugin Manager" "$BINDINGS" && ! grep -qF "hl.unbind" "$BINDINGS"'
-holds "and nothing else" 'grep -qF "\"Alpha thing\"" "$BINDINGS" && grep -qF "\"Kappa\"" "$BINDINGS"'
-holds "not even the plugin's own comment" 'grep -qxF -- "-- Kappa overlay (test.kappa)" "$BINDINGS"'
+holds "and nothing else" 'grep -qF "\"Alpha thing\"" "$BINDINGS" && grep -qF "\"Browser\"" "$BINDINGS"'
 out=$("$PM" unbind test.kappa)
-check "unbinding what the manager did not make is refused" '.ok == false' "$out"
+check "unbinding with nothing left to unbind is refused" '.ok == false' "$out"
+printf '\n-- Kappa overlay (test.kappa)\no.bind("SUPER + K", "Kappa", "kappa-open now")\n' >>"$BINDINGS"
+out=$("$PM" unbind test.kappa)
+check "a shortcut a plugin wrote for itself is unbound the same way" '.ok == true' "$out"
+holds "its block goes whole, and only it" \
+  '! grep -qF "(test.kappa)" "$BINDINGS" && ! grep -qF "\"Kappa\"" "$BINDINGS" && grep -qF "\"Alpha thing\"" "$BINDINGS"'
 out=$("$PM" unbind test.alpha)
 check "a binding written by hand cannot be unbound here" '.ok == false' "$out"
 

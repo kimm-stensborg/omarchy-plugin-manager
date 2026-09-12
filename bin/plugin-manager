@@ -386,13 +386,14 @@ cmd_list() {
             | select(.command | mentions($p))
             | . as $b
             | (.keys | combo) as $c
-            # Who wrote it, going by the comment just above: "manager" or "plugin".
+            # Who wrote it, going by the comment just above: "manager" or
+            # "plugin". The manager looks after it either way.
             | (first($markers[] | select(.id == $p.id and .file == $b.file
                                          and ($b.line - .line) >= 1 and ($b.line - .line) <= 2) | .by) // null) as $by
             | . + {active: (if $live == null then null
                             else any($live[]; .modmask == $c.modmask and (.key | ascii_upcase) == $c.key
                                               and .description == $b.description) end),
-                   managed: ($by == "manager"),
+                   managed: ($by != null),
                    addedBy: $by} ] as $shortcuts
         | [ $menu | to_entries[]
             | select((.value.action | type) == "string" and (.value.action | mentions($p)))
@@ -738,13 +739,17 @@ cmd_disable() {
 #   o.bind("SUPER + ALT + D", "Default Applications", "omarchy-shell shell toggle …")
 #
 # with an hl.unbind line between the two when it took over a combination
-# something else had. The comment is how it finds its own blocks again; it
-# never edits a binding it did not make.
+# something else had. The comment is how it finds its own blocks again. A
+# block a plugin wrote for itself, under the comment install.sh uses,
+#
+#   -- Default Applications (io.github.kimm-stensborg.default-apps)
+#
+# is looked after the same way. Any other binding is never edited.
 
-# The keys of the binding the manager made for a plugin, if it made one.
+# The keys of the binding the manager looks after for a plugin, if any.
 own_bind_keys() {
   jq -rn --argjson binds "$(config_binds_json)" --argjson markers "$(bind_markers_json)" --arg id "$1" "$JQ_KEYS"'
-    [ $markers[] | select(.id == $id and .by == "manager") as $m
+    [ $markers[] | select(.id == $id) as $m
       | $binds[] | select(.file == $m.file and (.line - $m.line) >= 1 and (.line - $m.line) <= 2)
       | .keys | combo | keylabel ] | .[0] // ""'
 }
@@ -789,11 +794,22 @@ cmd_suggest_key() {
       else {ok: false, message: "None of the usual combinations is free; type one"} end'
 }
 
-# The file without the manager's block for <id>; exits 3 when there was none.
+# The file without the block the manager looks after for <id> -- one it made,
+# or one the plugin wrote for itself -- and without the blank line before its
+# comment; exits 3 when there was none.
 strip_bind_block() {
   awk -v id="$1" -v mark="$BIND_MARK" '
-    index($0, "-- ") == 1 && index($0, "(" id "), " mark) > 0 && substr($0, length($0) - length(mark) + 1) == mark {
-      skip = 1; found = 1; next
+    function looked_after(line,   t) {
+      if (index(line, "-- ") != 1) return 0
+      if (index(line, "(" id "), " mark) > 0 && substr(line, length(line) - length(mark) + 1) == mark) return 1
+      t = line
+      sub(/[[:space:]]+$/, "", t)
+      return substr(t, length(t) - length(id) - 1) == "(" id ")"
+    }
+    looked_after($0) {
+      skip = 1; found = 1
+      if (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+      next
     }
     skip && ($0 ~ /^hl\.unbind\(/ || $0 ~ /^o\.bind\(/) { next }
     { skip = 0; lines[++n] = $0 }
@@ -892,12 +908,12 @@ cmd_unbind() {
   local id="${1:-}" tmp name
   [[ -n $id ]] && valid_id "$id" || fail "a plugin id is required"
   name=$(plugin_name "$id")
-  [[ -f $BINDINGS ]] || fail "there is no shortcut the manager made for $name"
+  [[ -f $BINDINGS ]] || fail "there is no shortcut for $name the manager looks after"
   cp "$BINDINGS" "$BINDINGS_BACKUP"
   tmp=$(mktemp)
   if ! strip_bind_block "$id" "$BINDINGS" >"$tmp"; then
     rm -f "$tmp"
-    fail "there is no shortcut the manager made for $name"
+    fail "there is no shortcut for $name the manager looks after"
   fi
   cat "$tmp" >"$BINDINGS"
   rm -f "$tmp"

@@ -842,32 +842,24 @@ Item {
            { text: "Remove", kind: kind + "-remove", tip: "Remove the " + what }]
         : [{ text: "Add", kind: kind, tip: "Add a " + what + " that opens this plugin  (" + key + ")" }]
     }
+    // A shortcut's own description only where it tells something: beside
+    // another shortcut, or when it is more than the plugin's name again.
+    var many = opens.shortcuts.length > 1
     var rows = [
       { title: "Shortcut",
         lines: opens.shortcuts.map(function(s) {
-          return { keys: s.keys.split(" + "), note: s.description || "",
-                   tags: root.sourceTags(s.addedBy, s.active === false) }
+          var note = (s.description || "").trim()
+          return { keys: s.keys.split(" + "),
+                   note: many || note.toLowerCase() !== (p.name || "").toLowerCase() ? note : "",
+                   inactive: s.active === false }
         }),
         actions: actions(root.managedShortcut(p), "shortcut", "shortcut") },
       { title: "Menu",
-        lines: opens.menu.map(function(m) {
-          return { path: m.path.split(" › "),
-                   tags: root.sourceTags(m.addedBy || (m.managed ? "manager" : null), false) }
-        }),
+        lines: opens.menu.map(function(m) { return { path: m.path.split(" › ") } }),
         actions: actions(root.managedMenu(p), "menu", "menu entry") }
     ]
     return rows.filter(function(r) { return canOpen || r.lines.length > 0 })
                .map(function(r) { if (!r.lines.length) r.lines = [{ none: true }]; return r })
-  }
-
-  // The tag after a shortcut or menu entry saying who put it there, going by
-  // the comment above it, and one for a shortcut Hyprland does not have.
-  function sourceTags(by, inactive) {
-    var tags = [by === "plugin" ? { text: "by the plugin", tone: "plugin" }
-              : by === "manager" ? { text: "by Plugin Manager", tone: "manager" }
-              : { text: "custom", tone: "custom" }]
-    if (inactive) tags.push({ text: "not active", tone: "urgent" })
-    return tags
   }
 
   function openerAction(kind) {
@@ -1625,7 +1617,7 @@ Item {
                         model: openerRow.modelData.lines
 
                         // One shortcut or menu entry: its keys as keycaps or its
-                        // path, then tags for who put it there.
+                        // path, and a tag for a shortcut Hyprland does not have.
                         Flow {
                           id: openerLine
                           required property var modelData
@@ -1712,32 +1704,23 @@ Item {
                             font.pixelSize: Style.font.bodySmall
                           }
 
-                          Repeater {
-                            model: openerLine.modelData.tags || []
+                          Rectangle {
+                            visible: openerLine.modelData.inactive === true
+                            width: inactiveText.implicitWidth + Style.spacing.md * 2
+                            height: root.tagHeight
+                            radius: height / 2
+                            color: Util.alpha(root.urgent, 0.14)
+                            border.width: 1
+                            border.color: Util.alpha(root.urgent, 0.45)
 
-                            Rectangle {
-                              id: sourceTag
-                              required property var modelData
-                              readonly property color tone: modelData.tone === "plugin" ? root.accent
-                                : modelData.tone === "urgent" ? root.urgent
-                                : modelData.tone === "manager" ? root.foreground
-                                : root.muted
-                              width: tagText.implicitWidth + Style.spacing.md * 2
-                              height: root.tagHeight
-                              radius: height / 2
-                              color: modelData.tone === "custom" ? "transparent" : Util.alpha(tone, 0.14)
-                              border.width: 1
-                              border.color: Util.alpha(tone, 0.45)
-
-                              Text {
-                                id: tagText
-                                anchors.centerIn: parent
-                                textFormat: Text.PlainText
-                                text: sourceTag.modelData.text
-                                color: sourceTag.tone
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.caption
-                              }
+                            Text {
+                              id: inactiveText
+                              anchors.centerIn: parent
+                              textFormat: Text.PlainText
+                              text: "not active"
+                              color: root.urgent
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
                             }
                           }
                         }
@@ -2476,10 +2459,10 @@ Item {
               visible: text !== ""
               wrapMode: Text.WordWrap
               textFormat: Text.PlainText
-              text: own ? "Now: " + own.keys + ", set here earlier. Saving moves it."
-                : other ? "Now: " + other.keys
-                          + (other.addedBy === "plugin" ? ", set by the plugin itself" : ", set outside the manager")
-                          + ". Saving adds this one; that one stays."
+              text: own ? "Now: " + own.keys
+                          + (own.addedBy === "plugin" ? ", set by the plugin itself" : ", set here earlier")
+                          + ". Saving moves it."
+                : other ? "Now: " + other.keys + ", set outside the manager. Saving adds this one; that one stays."
                 : ""
               color: root.muted
               font.family: root.fontFamily
