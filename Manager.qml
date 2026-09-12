@@ -937,8 +937,11 @@ Item {
   function fields(p) {
     var list = []
     if (!p) return list
+    // Lines given an action, even an empty one, keep room for its button so
+    // their values line up.
     function add(label, value, action, actionText) {
-      if (value) list.push({ label: label, value: String(value), action: action || "", actionText: actionText || "" })
+      if (value) list.push({ label: label, value: String(value), slot: action !== undefined,
+                             action: action || "", actionText: actionText || "" })
     }
     add("Id", p.id)
     if (p.manifestId && p.manifestId !== p.id) add("Manifest id", p.manifestId)
@@ -959,14 +962,14 @@ Item {
       add("Shortcut", s.keys + (s.description ? "  ·  " + s.description : "")
                       + (s.managed ? "  (set here)" : "")
                       + (s.active === false ? "  (not active)" : ""),
-          canOpen && i === Math.max(ownKey, 0) ? "shortcut" : "", ownKey >= 0 ? "Change" : "Add")
+          canOpen && i === Math.max(ownKey, 0) ? "shortcut" : "", "Change")
     }
     if (canOpen && opens.shortcuts.length === 0) add("Shortcut", "none", "shortcut", "Add")
     var ownEntry = opens.menu.findIndex(function(m) { return m.managed && m.addedBy !== "plugin" })
     for (var j = 0; j < opens.menu.length; j++)
       add("Menu", opens.menu[j].path + (!opens.menu[j].managed ? ""
                   : opens.menu[j].addedBy === "plugin" ? "  (added by the plugin)" : "  (set here)"),
-          canOpen && j === Math.max(ownEntry, 0) ? "menu" : "", ownEntry >= 0 ? "Change" : "Add")
+          canOpen && j === Math.max(ownEntry, 0) ? "menu" : "", "Change")
     if (canOpen && opens.menu.length === 0) add("Menu", "none", "menu", "Add")
     for (var k = 0; k < opens.bar.length; k++) add("Bar", opens.bar[k].section + " section")
     if (opens.shortcuts.length + opens.menu.length + opens.bar.length === 0) add("Opens with", p.openCommand)
@@ -1530,7 +1533,7 @@ Item {
 
                   Text {
                     width: root.labelWidth
-                    anchors.verticalCenter: fieldAction.visible ? fieldAction.verticalCenter : undefined
+                    anchors.verticalCenter: fieldRow.modelData.slot ? parent.verticalCenter : undefined
                     textFormat: Text.PlainText
                     text: fieldRow.modelData.label
                     color: root.muted
@@ -1538,33 +1541,52 @@ Item {
                     font.pixelSize: Style.font.caption
                   }
 
+                  // Room for the button that opens the shortcut or menu dialog,
+                  // as wide as a Change button whether or not this line has one.
+                  Item {
+                    id: fieldSlot
+                    visible: fieldRow.modelData.slot
+                    width: slotSizer.implicitWidth
+                    height: slotSizer.implicitHeight
+
+                    Button {
+                      id: slotSizer
+                      visible: false
+                      bordered: true
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      horizontalPadding: Style.spacing.md
+                      verticalPadding: Style.spacing.xxs
+                      text: "Change"
+                    }
+
+                    Button {
+                      anchors.fill: parent
+                      visible: fieldRow.modelData.action !== ""
+                      bordered: true
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      horizontalPadding: Style.spacing.md
+                      verticalPadding: Style.spacing.xxs
+                      text: fieldRow.modelData.actionText
+                      tooltipText: fieldRow.modelData.action === "shortcut"
+                        ? "Bind a key combination that opens this plugin  (s)"
+                        : "Put an entry for it in the Omarchy menu  (m)"
+                      onClicked: fieldRow.modelData.action === "shortcut" ? root.askBind() : root.askMenu()
+                    }
+                  }
+
                   Text {
                     width: detailsColumn.width - root.labelWidth - Style.spacing.lg
-                           - (fieldAction.visible ? fieldAction.width + Style.spacing.lg : 0)
-                    anchors.verticalCenter: fieldAction.visible ? fieldAction.verticalCenter : undefined
+                           - (fieldSlot.visible ? fieldSlot.width + Style.spacing.lg : 0)
+                    anchors.verticalCenter: fieldRow.modelData.slot ? parent.verticalCenter : undefined
                     wrapMode: Text.WrapAnywhere
                     textFormat: Text.PlainText
                     text: fieldRow.modelData.value
                     color: fieldRow.modelData.value === "none" ? root.muted : root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
-                  }
-
-                  // Opens the shortcut or menu dialog for this line.
-                  Button {
-                    id: fieldAction
-                    visible: fieldRow.modelData.action !== ""
-                    bordered: true
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    horizontalPadding: Style.spacing.md
-                    verticalPadding: Style.spacing.xxs
-                    text: fieldRow.modelData.actionText
-                    tooltipText: fieldRow.modelData.action === "shortcut"
-                      ? "Bind a key combination that opens this plugin  (s)"
-                      : "Put an entry for it in the Omarchy menu  (m)"
-                    onClicked: fieldRow.modelData.action === "shortcut" ? root.askBind() : root.askMenu()
                   }
                 }
               }
@@ -2260,11 +2282,17 @@ Item {
 
             Text {
               width: parent.width
-              visible: root.managedShortcut(root.current) !== null
+              // A shortcut set outside the manager is not its to move: saving
+              // adds another next to it.
+              readonly property var own: root.binding ? root.managedShortcut(root.current) : null
+              readonly property var other: root.binding && root.current && root.current.opens
+                && root.current.opens.shortcuts.length ? root.current.opens.shortcuts[0] : null
+              visible: text !== ""
               wrapMode: Text.WordWrap
               textFormat: Text.PlainText
-              text: root.managedShortcut(root.current)
-                ? "Now: " + root.managedShortcut(root.current).keys + ", set here earlier. Saving moves it." : ""
+              text: own ? "Now: " + own.keys + ", set here earlier. Saving moves it."
+                : other ? "Now: " + other.keys + ", set outside the manager. Saving adds this one; that one stays."
+                : ""
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -2488,13 +2516,19 @@ Item {
 
             Text {
               width: parent.width
-              visible: menuDialog.own !== null
+              // An entry written outside the manager is not its to move:
+              // saving adds another next to it.
+              readonly property var other: root.menuing && root.current && root.current.opens
+                && root.current.opens.menu.length ? root.current.opens.menu[0] : null
+              visible: text !== ""
               wrapMode: Text.WordWrap
               textFormat: Text.PlainText
-              text: !menuDialog.own ? ""
-                : "Now: " + menuDialog.own.path
+              text: menuDialog.own
+                ? "Now: " + menuDialog.own.path
                   + (menuDialog.own.addedBy === "plugin" ? ", added by the plugin itself" : ", added here earlier")
                   + ". Saving moves it."
+                : other ? "Now: " + other.path + ", added outside the manager. Saving adds this one; that one stays."
+                : ""
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
