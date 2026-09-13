@@ -6,6 +6,7 @@
 # cloning, validation, rollback and shell rescans stay Omarchy's business.
 #
 #   plugin-manager list
+#   plugin-manager avatars
 #   plugin-manager check [id] [--if-stale SECONDS] [--notify]
 #   plugin-manager review <id>
 #   plugin-manager inspect <id>
@@ -37,6 +38,7 @@ SELF_ID="io.github.kimm-stensborg.plugin-manager"
 PLUGINS_DIR="$HOME/.config/omarchy/plugins"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/plugin-manager"
 CACHE="$CACHE_DIR/updates.json"
+AVATAR_DIR="$CACHE_DIR/avatars"
 MAX_COMMITS=20
 MAX_DIFF_LINES=3000
 MAX_README_BYTES=65536
@@ -339,6 +341,11 @@ menu_markers_json() {
     }' "$MENU_USER" | jq -Rsc '[split("\n")[] | select(length > 0) | split("\t") | {plugin: .[0], entry: .[1], by: .[2]}]'
 }
 
+# The avatars fetched so far, as file names.
+avatar_files_json() {
+  find "$AVATAR_DIR" -maxdepth 1 -name '*.png' -printf '%f\n' 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0))'
+}
+
 cmd_list() {
   local shell_plugins cache config id
   local items=()
@@ -359,8 +366,14 @@ cmd_list() {
     --argjson binds "$(config_binds_json)" --argjson markers "$(bind_markers_json)" \
     --argjson live "$(live_binds_json)" --argjson menu "$(menu_entries_json)" \
     --argjson menuMarks "$(menu_markers_json)" \
+    --arg avatarDir "$AVATAR_DIR" --argjson avatars "$(avatar_files_json)" \
     --argjson config "$config" --arg braces "'{}'" "$JQ_KEYS"'
     def eid: if type == "object" then (.id // "") else tostring end;
+    # "someone" from https://github.com/someone/repo, git@github.com:someone/repo.git
+    # or ssh://git@github.com/someone/repo; null for any other host.
+    def ghowner:
+      [capture("^(?:https?://(?:[^@/]+@)?github\\.com/|git@github\\.com:|ssh://git@github\\.com/)(?<o>[A-Za-z0-9][A-Za-z0-9-]*)/")]
+      | .[0].o // null;
     def esc: gsub("(?<c>[.*+?^$()\\[\\]{}|\\\\])"; "\\\(.c)");
     # A command belongs to a plugin when it names its id or runs one of its scripts.
     def mentions($p):
@@ -415,9 +428,46 @@ cmd_list() {
             | if ($commands | length) > 0 then $commands[0]
               elif any(.kinds[]; . == "overlay" or . == "panel" or . == "menu")
               then "omarchy-shell shell toggle \($p.id) \($braces)"
-              else "" end))
+              else "" end)
+        # The GitHub account of its author, from a github.com remote, and the
+        # avatar fetched for it by the avatars command, if there is one yet.
+        | .owner = ((.git.remote // "") | ghowner)
+        | .avatar = (if .owner != null and any($avatars[]; . == ($p.git.remote // "" | ghowner // "" | ascii_downcase) + ".png")
+                     then "\($avatarDir)/\(.owner | ascii_downcase).png" else "" end))
     | sort_by(.name | ascii_downcase)
     | {ok: true, checkedAt: ($cache.checkedAt // null), plugins: .}'
+}
+
+# ---------------------------------------------------------------- avatars
+
+# avatars -- fetch the GitHub avatar of each account the list names as an
+# owner into the cache, for the overlay to show beside its plugins. One is
+# fetched when it is missing or a week old; one that failed is not asked for
+# again for a day. Only what reads as a PNG or a JPEG is kept.
+cmd_avatars() {
+  local owner key file tmp magic fetched=() failed=()
+  mkdir -p "$AVATAR_DIR"
+  while IFS= read -r owner; do
+    [[ -n $owner ]] || continue
+    key="${owner,,}"
+    file="$AVATAR_DIR/$key.png"
+    [[ -f $file && -z $(find "$file" -mmin +10080 2>/dev/null) ]] && continue
+    [[ -n $(find "$AVATAR_DIR/.$key.failed" -mmin -1440 2>/dev/null) ]] && continue
+    tmp=$(mktemp "$AVATAR_DIR/.fetch.XXXXXX")
+    if curl -fsSL --max-time 10 -o "$tmp" "https://github.com/$owner.png?size=96" 2>/dev/null &&
+      magic=$(head -c 4 "$tmp" | od -An -tx1 | tr -d ' \n') && [[ $magic == 89504e47 || $magic == ffd8ff* ]]; then
+      mv -f "$tmp" "$file"
+      rm -f "$AVATAR_DIR/.$key.failed"
+      fetched+=("$owner")
+    else
+      rm -f "$tmp"
+      touch "$AVATAR_DIR/.$key.failed"
+      failed+=("$owner")
+    fi
+  done < <(cmd_list | jq -r '[.plugins[].owner // empty] | unique[]')
+  jq -cn --argjson fetched "$(printf '%s\n' "${fetched[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    --argjson failed "$(printf '%s\n' "${failed[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    '{ok: true, fetched: $fetched, failed: $failed}'
 }
 
 # ------------------------------------------------------------------ check
@@ -1510,6 +1560,7 @@ command="${1:-}"
 
 case "$command" in
 list) cmd_list ;;
+avatars) cmd_avatars ;;
 check) cmd_check "$@" ;;
 review) cmd_review "$@" ;;
 inspect) cmd_inspect "$@" ;;

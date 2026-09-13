@@ -683,6 +683,48 @@ holds "a run really does the work" '[[ ! -e $PLUGINS/test.broken ]]'
 out=$("$PM" run --label x -- bogus)
 check "a failing command still leaves a reply" '.ok == false' "$out"
 
+# --------------------------------------------------------------- avatars
+# A curl that serves a PNG for any GitHub account but "ghost", and logs what
+# it was asked for.
+export CURL_LOG="$SANDBOX/curl.log"
+: >"$CURL_LOG"
+cat >"$SANDBOX/bin/curl" <<'SHIM'
+#!/bin/bash
+out="" url=""
+while (($# > 0)); do
+  case "$1" in
+  -o) out="$2"; shift 2 ;;
+  --max-time) shift 2 ;;
+  -*) shift ;;
+  *) url="$1"; shift ;;
+  esac
+done
+printf '%s\n' "$url" >>"$CURL_LOG"
+[[ $url == */ghost.png* ]] && exit 22
+printf '\x89PNG\r\n\x1a\nfake' >"$out"
+SHIM
+chmod +x "$SANDBOX/bin/curl"
+AVATARS="$XDG_CACHE_HOME/omarchy/plugin-manager/avatars"
+git -C "$PLUGINS/test.kappa" remote add origin https://github.com/Octo-Cat/kappa.git 2>/dev/null ||
+  git -C "$PLUGINS/test.kappa" remote set-url origin https://github.com/Octo-Cat/kappa.git
+git -C "$PLUGINS/test.alpha" remote set-url origin git@github.com:ghost/alpha.git
+out=$("$PM" list)
+check "a github.com remote names its owner, over https or ssh, with no avatar yet" \
+  '(.plugins[] | select(.id == "test.kappa") | .owner == "Octo-Cat" and .avatar == "") and (.plugins[] | select(.id == "test.alpha") | .owner == "ghost")' "$out"
+check "any other remote names no owner" \
+  'all(.plugins[] | select(.id != "test.kappa" and .id != "test.alpha"); .owner == null)' "$out"
+out=$("$PM" avatars)
+check "avatars fetches what it can and says what it could not" \
+  '.ok == true and .fetched == ["Octo-Cat"] and .failed == ["ghost"]' "$out"
+holds "an avatar is kept under its owner, lower-cased" '[[ -f $AVATARS/octo-cat.png ]]'
+holds "and nothing is kept for one that failed" '[[ ! -e $AVATARS/ghost.png ]]'
+check "the list then points at it" \
+  '.plugins[] | select(.id == "test.kappa") | .avatar == "'"$AVATARS"'/octo-cat.png"' "$("$PM" list)"
+calls=$(wc -l <"$CURL_LOG")
+out=$("$PM" avatars)
+check "a second run fetches nothing" '.fetched == [] and .failed == []' "$out"
+holds "and asks for neither the one it has nor the one that failed" '[[ $(wc -l <"$CURL_LOG") == "$calls" ]]'
+
 out=$("$PM" bogus)
 check "an unknown command fails as JSON" '.ok == false' "$out"
 

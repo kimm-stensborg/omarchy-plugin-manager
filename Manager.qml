@@ -1,6 +1,7 @@
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
+import Quickshell.Widgets
 import QtQuick
 import qs.Commons
 import qs.Ui
@@ -33,6 +34,7 @@ Item {
 
   property bool opened: false
   property var plugins: []
+  property bool avatarsAsked: false
   property string checkedAt: ""
   property int selectedIndex: 0
   // Select this id once the next list arrives -- a plugin that was just added.
@@ -138,6 +140,7 @@ Item {
   readonly property int labelWidth: Style.space(92)
   // Keycaps, tags and the text beside them in the shortcut and menu section.
   readonly property int tagHeight: Math.ceil(Style.font.bodySmall * 1.4) + Style.spacing.xxs * 2
+  readonly property int avatarSize: Math.round(root.rowHeight * 0.6)
   readonly property int cardWidth: Math.min(Style.space(1040), panel.width - Style.gapsOut * 2)
   readonly property int cardHeight: Math.min(Style.space(640), panel.height - Style.gapsOut * 2)
 
@@ -242,6 +245,24 @@ Item {
     root.selectId = ""
     root.now = Date.now()
     root.inspectPending()
+    root.fetchAvatars()
+  }
+
+  // Fetch the GitHub avatars the list is missing, once per load and in the
+  // background; the list is read again when any came in.
+  function fetchAvatars() {
+    if (root.avatarsAsked || avatarProc.running) return
+    if (!root.plugins.some(function(p) { return p.owner && !p.avatar })) return
+    root.avatarsAsked = true
+    avatarProc.running = true
+  }
+
+  // Up to two initials for a plugin without an avatar: its author's, else
+  // its own name's.
+  function initials(p) {
+    var words = String(p && (p.author || p.name) || "").split(/[\s._-]+/)
+                  .filter(function(w) { return w.length > 0 })
+    return words.slice(0, 2).map(function(w) { return w.charAt(0).toUpperCase() }).join("")
   }
 
   // --------------------------------------------------------------- actions
@@ -1114,6 +1135,18 @@ Item {
     onExited: Qt.callLater(root.inspectPending)
   }
 
+  // Avatars, apart from the rest: it waits on the network.
+  Process {
+    id: avatarProc
+    command: [root.backend, "avatars"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var payload = root.parseJson(text)
+        if (payload && payload.fetched && payload.fetched.length > 0) root.refresh()
+      }
+    }
+  }
+
   // Suggestions and checks for the shortcut dialog, apart from quickProc so
   // typing never waits on an action.
   Process {
@@ -1350,9 +1383,45 @@ Item {
               radius: root.cornerRadius
               color: row.selected ? root.selectedBackground : "transparent"
 
-              Column {
+              // Its author: the GitHub avatar, or initials without one.
+              ClippingRectangle {
+                id: avatar
                 anchors.left: parent.left
                 anchors.leftMargin: Style.spacing.rowPaddingX
+                anchors.verticalCenter: parent.verticalCenter
+                width: root.avatarSize
+                height: root.avatarSize
+                radius: width / 2
+                color: root.faint
+
+                Text {
+                  anchors.centerIn: parent
+                  visible: avatarImage.status !== Image.Ready
+                  textFormat: Text.PlainText
+                  text: root.initials(row.modelData)
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                Image {
+                  id: avatarImage
+                  anchors.fill: parent
+                  source: row.modelData.avatar ? Util.fileUrl(row.modelData.avatar) : ""
+                  sourceSize.width: 96
+                  sourceSize.height: 96
+                  fillMode: Image.PreserveAspectCrop
+                  asynchronous: true
+                  cache: false
+                  smooth: true
+                  mipmap: true
+                }
+              }
+
+              Column {
+                anchors.left: avatar.right
+                anchors.leftMargin: Style.spacing.lg
                 anchors.right: badges.left
                 anchors.rightMargin: Style.spacing.md
                 anchors.verticalCenter: parent.verticalCenter

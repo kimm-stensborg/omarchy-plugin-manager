@@ -82,6 +82,10 @@ omarchy-shell shell toggle io.github.kimm-stensborg.plugin-manager '{}'
 For every plugin:
 
 - name, version, description, author, license and kinds
+- in the list, its author's GitHub avatar when it comes from github.com, and
+  their initials otherwise. Avatars are fetched from github.com in the
+  background into `~/.cache/omarchy/plugin-manager/avatars`, once, and again
+  after a week
 - whether it is enabled
 - its remote, branch, commit and last commit
 - **how it opens**: its shortcuts, its entries in the Omarchy menu, and its
