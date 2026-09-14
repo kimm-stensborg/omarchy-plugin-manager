@@ -112,6 +112,8 @@ Item {
   readonly property var current: root.selectedIndex >= 0 && root.selectedIndex < root.plugins.length
     ? root.plugins[root.selectedIndex] : null
   readonly property bool currentIsSelf: root.current !== null && root.current.self === true
+  readonly property var primary: root.primaryAction(root.current)
+  readonly property string primaryKind: root.primary ? root.primary.kind : ""
   readonly property int updateCount: {
     var n = 0
     for (var i = 0; i < root.plugins.length; i++) if (root.behind(root.plugins[i]) > 0) n++
@@ -143,6 +145,72 @@ Item {
   readonly property int avatarSize: Math.round(root.rowHeight * 0.6)
   readonly property int cardWidth: Math.min(Style.space(1040), panel.width - Style.gapsOut * 2)
   readonly property int cardHeight: Math.min(Style.space(640), panel.height - Style.gapsOut * 2)
+  readonly property int detailAvatarSize: root.avatarSize * 2
+
+  // A plugin's author: the GitHub avatar, or initials without one. In each
+  // list row, and larger at the head of the details. Inline components do
+  // not see `root`, so this and Pill take the theme tokens straight.
+  component Avatar: ClippingRectangle {
+    id: avatarRoot
+    property var plugin: null
+    property string initials: ""
+    property real fontSize: Style.font.caption
+
+    radius: width / 2
+    color: Util.alpha(Color.menu.text, 0.15)
+
+    Text {
+      anchors.centerIn: parent
+      visible: avatarImage.status !== Image.Ready
+      textFormat: Text.PlainText
+      text: avatarRoot.initials
+      color: Util.alpha(Color.menu.text, 0.6)
+      font.family: Style.font.menuFamily
+      font.pixelSize: avatarRoot.fontSize
+      font.bold: true
+    }
+
+    Image {
+      id: avatarImage
+      anchors.fill: parent
+      source: avatarRoot.plugin && avatarRoot.plugin.avatar ? Util.fileUrl(avatarRoot.plugin.avatar) : ""
+      sourceSize.width: 128
+      sourceSize.height: 128
+      fillMode: Image.PreserveAspectCrop
+      asynchronous: true
+      cache: false
+      smooth: true
+      mipmap: true
+    }
+  }
+
+  // A small rounded tag: whether a plugin is on, its kinds, an update count,
+  // a problem, an override.
+  component Pill: Rectangle {
+    id: pill
+    property string text: ""
+    property color tint: Color.menu.text
+    property color textColor: tint
+    property bool bold: false
+
+    width: Math.max(height, pillText.implicitWidth + Style.spacing.md * 2)
+    height: Math.ceil(Style.font.bodySmall * 1.4) + Style.spacing.xxs * 2
+    radius: height / 2
+    color: Util.alpha(pill.tint, 0.12)
+    border.width: 1
+    border.color: Util.alpha(pill.tint, 0.35)
+
+    Text {
+      id: pillText
+      anchors.centerIn: parent
+      textFormat: Text.PlainText
+      text: pill.text
+      color: pill.textColor
+      font.family: Style.font.menuFamily
+      font.pixelSize: Style.font.caption
+      font.bold: pill.bold
+    }
+  }
 
   // ------------------------------------------------------------- lifecycle
 
@@ -990,7 +1058,53 @@ Item {
     if (p.version) parts.push("v" + p.version)
     if (p.git && p.git.branch) parts.push(p.git.branch)
     if (p.self) parts.push("this manager")
+    if (!p.enabled) parts.push("disabled")
     return parts.join("  ·  ")
+  }
+
+  // Under the name in the details: who wrote it, and its license.
+  function byline(p) {
+    var parts = []
+    if (p && p.author) parts.push("by " + p.author)
+    if (p && p.license) parts.push(p.license)
+    return parts.join("  ·  ")
+  }
+
+  // The pills under the name: on or off, then the kinds the shell loads it as.
+  function tags(p) {
+    if (!p) return []
+    var list = [p.enabled ? { text: "● enabled", tint: root.accent, textColor: root.accent }
+                          : { text: "○ disabled", tint: root.foreground, textColor: root.foreground }]
+    var kinds = p.kinds || []
+    for (var i = 0; i < kinds.length; i++) list.push({ text: kinds[i], tint: root.foreground, textColor: root.muted })
+    return list
+  }
+
+  // The one action that stands out under the details: the update waiting,
+  // else switching a disabled plugin on, else opening it.
+  function primaryAction(p) {
+    if (!p) return null
+    var n = root.behind(p)
+    if (n > 0)
+      return { kind: "update", text: "Update (" + n + ")", tip: "Review what an update brings in, then update  (u)" }
+    if (!p.self && !p.enabled && p.valid)
+      return { kind: "enable", text: "Enable", tip: "Switch the plugin on  (e)" }
+    if (!p.self && p.enabled && p.openCommand)
+      return { kind: "open", text: "Open", tip: "Close the manager and open this plugin  (⏎)" }
+    return null
+  }
+
+  function runPrimary(kind) {
+    if (kind === "update") root.updateCurrent()
+    else if (kind === "enable") root.toggleEnabled()
+    else if (kind === "open") root.openPlugin()
+  }
+
+  // /home/me/… as ~/…
+  function homePath(path) {
+    var home = Quickshell.env("HOME")
+    var s = String(path || "")
+    return home && s.indexOf(home + "/") === 0 ? "~" + s.slice(home.length) : s
   }
 
   // A browsable page for the remote, when there is one: https remotes as they
@@ -1006,7 +1120,7 @@ Item {
   function updateLine(p) {
     if (!p) return { text: "", color: root.muted }
     var u = p.update
-    if (!u) return { text: "Not checked for updates yet  (c)", color: root.muted }
+    if (!u) return { text: "Not checked for updates yet", color: root.muted }
     if (u.error) return { text: "Could not check: " + u.error, color: root.urgent }
     if (u.behind > 0) {
       var text = root.commitsText(u.behind) + " upstream"
@@ -1027,30 +1141,35 @@ Item {
     return list
   }
 
-  function fields(p) {
+  // The facts under the shortcut and menu section. Its place in the bar;
+  // with no shortcut, menu entry or bar place, the command the Open button
+  // runs; and its last update, which can be rolled back.
+  function facts(p) {
     var list = []
     if (!p) return list
     function add(label, value) { if (value) list.push({ label: label, value: String(value) }) }
-    add("Id", p.id)
-    if (p.manifestId && p.manifestId !== p.id) add("Manifest id", p.manifestId)
-    add("Author", p.author)
-    add("License", p.license)
-    add("Kinds", (p.kinds || []).join(", "))
-    add("Status", p.enabled ? "enabled" : "disabled")
-    // Its place in the bar. Shortcuts and menu entries have their own section
-    // under these; with none of the three, the command the Open button runs.
     var opens = p.opens || { shortcuts: [], menu: [], bar: [] }
     for (var k = 0; k < opens.bar.length; k++) add("Bar", opens.bar[k].section + " section")
     if (opens.shortcuts.length + opens.menu.length + opens.bar.length === 0) add("Opens with", p.openCommand)
     if (p.rollback)
       add("Last update", root.ago(p.rollback.at) + ", from " + p.rollback.from
                          + (p.rollback.fromVersion ? " (v" + p.rollback.fromVersion + ")" : "") + "  ·  b rolls it back")
+    return list
+  }
+
+  // Where it comes from, under a header of its own at the bottom.
+  function sourceFields(p) {
+    var list = []
+    if (!p) return list
+    function add(label, value) { if (value) list.push({ label: label, value: String(value) }) }
     if (p.git) {
-      add("Remote", p.git.remote)
+      add("Repository", root.webUrl(p).replace(/^https?:\/\//, "") || p.git.remote)
       add("Branch", p.git.branch + (p.git.commit ? " @ " + p.git.commit : ""))
       add("Last commit", p.git.subject + (p.git.date ? "  ·  " + p.git.date.slice(0, 10) : ""))
     }
-    add("Path", p.path)
+    add("Id", p.id)
+    if (p.manifestId && p.manifestId !== p.id) add("Manifest id", p.manifestId)
+    add("Path", root.homePath(p.path))
     return list
   }
 
@@ -1383,40 +1502,17 @@ Item {
               radius: root.cornerRadius
               color: row.selected ? root.selectedBackground : "transparent"
 
-              // Its author: the GitHub avatar, or initials without one.
-              ClippingRectangle {
+              // A disabled plugin is greyed out: its avatar faded, its name muted.
+              Avatar {
                 id: avatar
                 anchors.left: parent.left
                 anchors.leftMargin: Style.spacing.rowPaddingX
                 anchors.verticalCenter: parent.verticalCenter
                 width: root.avatarSize
                 height: root.avatarSize
-                radius: width / 2
-                color: root.faint
-
-                Text {
-                  anchors.centerIn: parent
-                  visible: avatarImage.status !== Image.Ready
-                  textFormat: Text.PlainText
-                  text: root.initials(row.modelData)
-                  color: root.muted
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                }
-
-                Image {
-                  id: avatarImage
-                  anchors.fill: parent
-                  source: row.modelData.avatar ? Util.fileUrl(row.modelData.avatar) : ""
-                  sourceSize.width: 96
-                  sourceSize.height: 96
-                  fillMode: Image.PreserveAspectCrop
-                  asynchronous: true
-                  cache: false
-                  smooth: true
-                  mipmap: true
-                }
+                opacity: row.modelData.enabled ? 1 : 0.45
+                plugin: row.modelData
+                initials: root.initials(row.modelData)
               }
 
               Column {
@@ -1432,7 +1528,7 @@ Item {
                   elide: Text.ElideRight
                   textFormat: Text.PlainText
                   text: row.modelData.name
-                  color: row.selected ? root.selectedText : root.foreground
+                  color: row.selected ? root.selectedText : (row.modelData.enabled ? root.foreground : root.muted)
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                 }
@@ -1453,35 +1549,32 @@ Item {
                 anchors.right: parent.right
                 anchors.rightMargin: Style.spacing.rowPaddingX
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.spacing.md
+                spacing: Style.spacing.sm
 
                 Text {
-                  visible: root.behind(row.modelData) > 0
+                  visible: row.working
+                  anchors.verticalCenter: parent.verticalCenter
                   textFormat: Text.PlainText
-                  text: "↑" + root.behind(row.modelData)
+                  text: "…"
                   color: root.accent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
                 }
 
-                Text {
-                  visible: !row.modelData.valid || (row.modelData.git && row.modelData.git.dirty)
-                    || (row.modelData.update && row.modelData.update.error !== "")
-                  textFormat: Text.PlainText
-                  text: "!"
-                  color: root.urgent
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
+                Pill {
+                  visible: root.behind(row.modelData) > 0
+                  text: "↑ " + root.behind(row.modelData)
+                  tint: root.accent
+                  bold: true
                 }
 
-                Text {
-                  textFormat: Text.PlainText
-                  text: row.working ? "…" : (row.modelData.enabled ? "on" : "off")
-                  color: row.modelData.enabled ? root.foreground : root.muted
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                Pill {
+                  visible: !row.modelData.valid || (row.modelData.git && row.modelData.git.dirty)
+                    || (row.modelData.update && row.modelData.update.error !== "")
+                  text: "!"
+                  tint: root.urgent
+                  bold: true
                 }
               }
 
@@ -1523,26 +1616,80 @@ Item {
               width: details.width
               spacing: root.contentSpacing
 
+              // The head: its author's avatar beside its name and version, who
+              // wrote it, and pills for whether it is on and its kinds.
               Row {
+                width: parent.width
                 spacing: Style.spacing.lg
 
-                Text {
-                  id: detailName
-                  textFormat: Text.PlainText
-                  text: root.current ? root.current.name : ""
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.heading
-                  font.bold: true
+                Avatar {
+                  id: detailAvatar
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: root.detailAvatarSize
+                  height: root.detailAvatarSize
+                  plugin: root.current
+                  initials: root.initials(root.current)
+                  fontSize: Style.font.body
                 }
 
-                Text {
-                  anchors.baseline: detailName.baseline
-                  textFormat: Text.PlainText
-                  text: root.current && root.current.version ? "v" + root.current.version : ""
-                  color: root.muted
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
+                Column {
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - detailAvatar.width - parent.spacing
+                  spacing: Style.spacing.xs
+
+                  Row {
+                    width: parent.width
+                    spacing: Style.spacing.lg
+
+                    Text {
+                      id: detailName
+                      width: Math.min(implicitWidth, parent.width - detailVersion.implicitWidth - parent.spacing)
+                      elide: Text.ElideRight
+                      textFormat: Text.PlainText
+                      text: root.current ? root.current.name : ""
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.heading
+                      font.bold: true
+                    }
+
+                    Text {
+                      id: detailVersion
+                      anchors.baseline: detailName.baseline
+                      textFormat: Text.PlainText
+                      text: root.current && root.current.version ? "v" + root.current.version : ""
+                      color: root.muted
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                    }
+                  }
+
+                  Text {
+                    width: parent.width
+                    visible: text !== ""
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    text: root.byline(root.current)
+                    color: root.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Flow {
+                    width: parent.width
+                    spacing: Style.spacing.sm
+
+                    Repeater {
+                      model: root.tags(root.current)
+
+                      Pill {
+                        required property var modelData
+                        text: modelData.text
+                        tint: modelData.tint
+                        textColor: modelData.textColor
+                      }
+                    }
+                  }
                 }
               }
 
@@ -1557,15 +1704,35 @@ Item {
                 font.pixelSize: Style.font.body
               }
 
-              Text {
+              // How it stands with upstream, and a quiet button to ask again.
+              Row {
                 width: parent.width
-                wrapMode: Text.WordWrap
-                textFormat: Text.PlainText
-                readonly property var line: root.updateLine(root.current)
-                text: line.text
-                color: line.color
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
+                spacing: Style.spacing.md
+
+                Text {
+                  readonly property var line: root.updateLine(root.current)
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Math.min(implicitWidth, parent.width - checkButton.width - parent.spacing)
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: line.text
+                  color: line.color
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                Button {
+                  id: checkButton
+                  anchors.verticalCenter: parent.verticalCenter
+                  foreground: root.muted
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  horizontalPadding: Style.spacing.md
+                  verticalPadding: Style.spacing.xxs
+                  text: "Check"
+                  tooltipText: "Look upstream for an update  (c)"
+                  onClicked: root.checkCurrent()
+                }
               }
 
               Repeater {
@@ -1640,8 +1807,9 @@ Item {
                 color: root.faint
               }
 
-              Repeater {
-                model: root.fields(root.current)
+              // One fact: its label, and its value wrapping under itself.
+              Component {
+                id: fieldDelegate
 
                 Row {
                   id: fieldRow
@@ -1669,15 +1837,7 @@ Item {
                 }
               }
 
-              // Shortcut and menu, apart from the facts above: what there is,
-              // and the buttons that manage it.
-              Rectangle {
-                width: parent.width
-                height: 1
-                color: root.faint
-                visible: openersRepeater.count > 0
-              }
-
+              // Shortcut and menu: what there is, and the buttons that manage it.
               Repeater {
                 id: openersRepeater
                 model: root.openers(root.current)
@@ -1801,44 +1961,17 @@ Item {
                           }
 
                           // Set from the manager, in place of what the plugin set.
-                          Rectangle {
+                          Pill {
                             visible: openerLine.modelData.override === true
-                            width: overrideText.implicitWidth + Style.spacing.md * 2
-                            height: root.tagHeight
-                            radius: height / 2
-                            color: Util.alpha(root.foreground, 0.08)
-                            border.width: 1
-                            border.color: Util.alpha(root.foreground, 0.25)
-
-                            Text {
-                              id: overrideText
-                              anchors.centerIn: parent
-                              textFormat: Text.PlainText
-                              text: "override"
-                              color: root.muted
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.caption
-                            }
+                            text: "override"
+                            tint: root.foreground
+                            textColor: root.muted
                           }
 
-                          Rectangle {
+                          Pill {
                             visible: openerLine.modelData.inactive === true
-                            width: inactiveText.implicitWidth + Style.spacing.md * 2
-                            height: root.tagHeight
-                            radius: height / 2
-                            color: Util.alpha(root.urgent, 0.14)
-                            border.width: 1
-                            border.color: Util.alpha(root.urgent, 0.45)
-
-                            Text {
-                              id: inactiveText
-                              anchors.centerIn: parent
-                              textFormat: Text.PlainText
-                              text: "not active"
-                              color: root.urgent
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.caption
-                            }
+                            text: "not active"
+                            tint: root.urgent
                           }
                         }
                       }
@@ -1876,101 +2009,122 @@ Item {
                   }
                 }
               }
+
+              Repeater {
+                model: root.facts(root.current)
+                delegate: fieldDelegate
+              }
+
+              // Where it comes from: the repo, and where it sits on disk.
+              // Set off from the facts above by more than their own spacing;
+              // the default top padding is the glyph overshoot it reserves.
+              PanelSectionHeader {
+                topPadding: Math.ceil(fontSize * 0.15) + Style.spacing.md
+                text: "SOURCE"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Repeater {
+                model: root.sourceFields(root.current)
+                delegate: fieldDelegate
+              }
             }
           }
 
-          // The actions under the details. Right to left, so they sit against
-          // the right edge and wrap onto a second row rather than run under
-          // the list; the children are listed last to first for that reason.
-          Flow {
+          // The actions under the details: the one that matters now stands
+          // out (see primaryAction), the rest stay quiet beside it, and
+          // Remove keeps apart on the left.
+          Item {
             id: actions
             visible: root.current !== null
             anchors.left: divider.right
             anchors.leftMargin: root.contentMargin
             anchors.right: parent.right
             anchors.bottom: parent.bottom
-            layoutDirection: Qt.RightToLeft
-            spacing: Style.spacing.controlGap
+            height: Math.max(removeButton.implicitHeight, actionFlow.implicitHeight)
 
-            // Plain like the rest: the confirmation is where it turns red.
+            // Quiet like the rest: the confirmation is where it turns red.
             Button {
+              id: removeButton
               visible: !root.currentIsSelf
-              bordered: true
-              foreground: root.foreground
+              anchors.left: parent.left
+              anchors.bottom: parent.bottom
+              foreground: root.muted
               fontFamily: root.fontFamily
               text: "Remove"
               tooltipText: "Uninstall the plugin  (d)"
               onClicked: root.askRemove()
             }
 
-            Button {
-              visible: root.webUrl(root.current) !== ""
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              text: "Open repo"
-              tooltipText: "Open the repository in the browser  (o)"
-              onClicked: root.openRepo()
-            }
+            // Right to left, so they sit against the right edge and wrap onto
+            // a second row rather than run into Remove; the children are
+            // listed last to first for that reason.
+            Flow {
+              id: actionFlow
+              anchors.left: removeButton.visible ? removeButton.right : parent.left
+              anchors.leftMargin: Style.spacing.xl
+              anchors.right: parent.right
+              anchors.bottom: parent.bottom
+              layoutDirection: Qt.RightToLeft
+              spacing: Style.spacing.controlGap
 
-            Button {
-              visible: !root.currentIsSelf
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              text: root.current && root.current.enabled ? "Disable" : "Enable"
-              tooltipText: "Switch the plugin on or off  (e)"
-              onClicked: root.toggleEnabled()
-            }
+              Button {
+                visible: root.primary !== null
+                bordered: true
+                foreground: root.accent
+                background: Util.alpha(root.accent, 0.12)
+                fontFamily: root.fontFamily
+                text: root.primary ? root.primary.text : ""
+                tooltipText: root.primary ? root.primary.tip : ""
+                onClicked: root.runPrimary(root.primaryKind)
+              }
 
-            Button {
-              visible: root.current !== null && root.current.rollback !== null && root.current.rollback !== undefined
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              text: "Roll back"
-              tooltipText: "Go back to where it was before its last update  (b)"
-              onClicked: root.askRollback()
-            }
+              Button {
+                visible: root.current !== null && !root.currentIsSelf && !!root.current.openCommand
+                  && root.primaryKind !== "open"
+                foreground: root.current && root.current.enabled ? root.foreground : root.muted
+                fontFamily: root.fontFamily
+                text: "Open"
+                tooltipText: "Close the manager and open this plugin  (⏎)"
+                onClicked: root.openPlugin()
+              }
 
-            Button {
-              visible: root.current !== null
-              bordered: true
-              foreground: root.behind(root.current) > 0 ? root.accent : root.foreground
-              fontFamily: root.fontFamily
-              text: root.behind(root.current) > 0 ? "Update (" + root.behind(root.current) + ")" : "Update"
-              tooltipText: "Review what an update brings in, then update  (u)"
-              onClicked: root.updateCurrent()
-            }
+              Button {
+                visible: root.current !== null
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                text: "Read"
+                tooltipText: "Its files, what can run, and its README  (i)"
+                onClicked: root.inspectCurrent()
+              }
 
-            Button {
-              visible: root.current !== null
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              text: "Check"
-              tooltipText: "Look upstream for an update  (c)"
-              onClicked: root.checkCurrent()
-            }
+              Button {
+                visible: root.current !== null && root.current.rollback !== null && root.current.rollback !== undefined
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                text: "Roll back"
+                tooltipText: "Go back to where it was before its last update  (b)"
+                onClicked: root.askRollback()
+              }
 
-            Button {
-              visible: root.current !== null
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              text: "Read"
-              tooltipText: "Its files, what can run, and its README  (i)"
-              onClicked: root.inspectCurrent()
-            }
+              Button {
+                visible: !root.currentIsSelf && root.primaryKind !== "enable"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                text: root.current && root.current.enabled ? "Disable" : "Enable"
+                tooltipText: "Switch the plugin on or off  (e)"
+                onClicked: root.toggleEnabled()
+              }
 
-            Button {
-              visible: root.current !== null && !root.currentIsSelf
-              bordered: true
-              foreground: root.current && root.current.openCommand && root.current.enabled ? root.foreground : root.muted
-              fontFamily: root.fontFamily
-              text: "Open"
-              tooltipText: "Close the manager and open this plugin  (⏎)"
-              onClicked: root.openPlugin()
+              Button {
+                visible: root.webUrl(root.current) !== ""
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                text: "Open repo"
+                tooltipText: "Open the repository in the browser  (o)"
+                onClicked: root.openRepo()
+              }
             }
           }
         }
