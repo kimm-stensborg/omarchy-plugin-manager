@@ -154,7 +154,7 @@ Item {
   readonly property int avatarSize: Math.round(root.rowHeight * 0.6)
   readonly property int cardWidth: Math.min(Style.space(1040), panel.width - Style.gapsOut * 2)
   readonly property int cardHeight: Math.min(Style.space(640), panel.height - Style.gapsOut * 2)
-  readonly property int detailAvatarSize: root.avatarSize * 2
+  readonly property int detailAvatarSize: Math.round(root.avatarSize * 2.4)
 
   // A plugin's author: the GitHub avatar, or initials without one. In each
   // list row, and larger at the head of the details. Inline components do
@@ -1689,7 +1689,7 @@ Item {
               // wrote it, and pills for whether it is on and its kinds.
               Row {
                 width: parent.width
-                spacing: Style.spacing.lg
+                spacing: Style.spacing.xl
 
                 Avatar {
                   id: detailAvatar
@@ -1744,8 +1744,10 @@ Item {
                     font.pixelSize: Style.font.caption
                   }
 
+                  // A little apart from the name and byline above.
                   Flow {
                     width: parent.width
+                    topPadding: Style.spacing.xs
                     spacing: Style.spacing.sm
 
                     Repeater {
@@ -1762,9 +1764,12 @@ Item {
                 }
               }
 
+              // Set off from the head, and airy enough to read when it wraps.
               Text {
                 width: parent.width
                 visible: text !== ""
+                topPadding: Style.spacing.sm
+                lineHeight: 1.2
                 wrapMode: Text.WordWrap
                 textFormat: Text.PlainText
                 text: root.current ? root.current.description : ""
