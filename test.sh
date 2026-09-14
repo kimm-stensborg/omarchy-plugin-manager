@@ -383,6 +383,23 @@ check "a file that is not an export is refused" '.ok == false and (.message | te
 out=$("$PM" import "$SANDBOX/nowhere.json")
 check "a missing file is refused" '.ok == false and (.message | test("no file"))' "$out"
 
+# The Import button's search: the default export in the home folder from
+# above, one copied into ~/Downloads a while back, and a namesake that is not
+# an export at all.
+mkdir -p "$HOME/Downloads"
+cp "$SANDBOX/import.json" "$HOME/Downloads/omarchy-plugins-elsewhere-20260901.json"
+touch -d '2 days ago' "$HOME/Downloads/omarchy-plugins-elsewhere-20260901.json"
+echo '{}' >"$HOME/Downloads/omarchy-plugins-junk.json"
+home_export=$(ls "$HOME"/omarchy-plugins-*.json)
+out=$("$PM" exports)
+check "exports finds the exports in home and Downloads, newest first" \
+  ".ok == true and .message == \"2 export files\" and [.files[].path] == [\"$home_export\", \"$HOME/Downloads/omarchy-plugins-elsewhere-20260901.json\"]" "$out"
+check "exports says where each one came from and what it holds" \
+  '.files[1] | .host == "elsewhere" and .exportedAt == "2026-09-01T10:00:00+02:00" and .count == 5' "$out"
+rm "$home_export" "$HOME"/Downloads/omarchy-plugins-*.json
+out=$("$PM" exports)
+check "exports with none says where it looked" '.ok == true and .files == [] and .message == "No export files in ~ or ~/Downloads"' "$out"
+
 # --------------------------------------------------------------- opening
 # Shortcuts come from ~/.config/hypr/*.lua, checked against the stand-in
 # hyprctl; menu entries from the user's extension over Omarchy's real defaults,

@@ -54,6 +54,14 @@ Item {
   property bool confirmingImport: false
   property var importPreview: null
 
+  // The export files the Import button found, when there is more than one to
+  // pick from; a single one goes straight to its preview, once the search's
+  // process is done.
+  property bool importPicking: false
+  property var exportFiles: []
+  property int exportIndex: 0
+  property string pendingPreview: ""
+
   // An update waiting on its review: the reply of `plugin-manager review`.
   property bool reviewing: false
   property var review: null
@@ -245,6 +253,7 @@ Item {
     root.confirmingImport = false
     root.confirmingRollback = false
     root.importPreview = null
+    root.importPicking = false
     root.reviewing = false
     root.review = null
     root.inspecting = false
@@ -335,7 +344,7 @@ Item {
 
   // --------------------------------------------------------------- actions
 
-  readonly property var quickKinds: ["check", "export", "preview", "review", "inspect", "bind", "unbind",
+  readonly property var quickKinds: ["check", "export", "exports", "preview", "review", "inspect", "bind", "unbind",
                                      "menu", "menuremove"]
 
   // One action at a time: they all end in the stock commands, which rescan
@@ -383,6 +392,9 @@ Item {
       if (!quiet || summary.error) root.setStatus(summary.text, summary.error)
     } else if (kind === "preview") {
       root.showImportPreview(payload)
+      return
+    } else if (kind === "exports") {
+      root.showExports(payload)
       return
     } else if (kind === "review") {
       root.showReview(payload)
@@ -719,13 +731,68 @@ Item {
     root.runAction(["export"], "Exporting plugins", "", "export", false)
   }
 
+  // The Import button: look for export files in ~ and ~/Downloads. Also
+  // callable over IPC: `omarchy-shell shell call <id> findExports x`.
+  function findExports() {
+    root.runAction(["exports"], "Looking for export files", "", "exports", false)
+  }
+
+  function showExports(payload) {
+    var files = payload.files || []
+    if (files.length === 0) {
+      root.setStatus(payload.message + "; type the path of one in the field", false)
+      urlField.forceActiveFocus()
+      return
+    }
+    if (files.length === 1) {
+      root.pendingPreview = files[0].path
+      // Whichever comes last, this or the process exiting, starts it.
+      Qt.callLater(root.previewPending)
+      return
+    }
+    root.exportFiles = files.slice(0, 8)
+    root.exportIndex = 0
+    root.importPicking = true
+  }
+
+  function previewPending() {
+    var path = root.pendingPreview
+    if (!path || root.busy || quickProc.running) return
+    root.pendingPreview = ""
+    root.previewImport(path)
+  }
+
+  function pickExport(index) {
+    var file = root.exportFiles[index]
+    root.closeExports()
+    if (file) root.previewImport(file.path)
+  }
+
+  function closeExports() {
+    root.importPicking = false
+    keyCatcher.forceActiveFocus()
+  }
+
+  function exportsKey(event) {
+    var key = event.key
+    var t = event.text
+    if (key === Qt.Key_Escape) root.closeExports()
+    else if (key === Qt.Key_Up || t === "k") root.exportIndex = Math.max(0, root.exportIndex - 1)
+    else if (key === Qt.Key_Down || t === "j") root.exportIndex = Math.min(root.exportFiles.length - 1, root.exportIndex + 1)
+    else if (key === Qt.Key_Return || key === Qt.Key_Enter) root.pickExport(root.exportIndex)
+  }
+
   // A dry run came back: show what the import would do and let it be confirmed.
   function showImportPreview(payload) {
     var plan = payload.plan || []
     var installs = 0
     for (var i = 0; i < plan.length; i++) if (plan[i].action === "install") installs++
     if (installs === 0) {
-      root.setStatus(payload.message + ": everything in the file is already here or was skipped", false)
+      var here = plan.length > 0 && plan.every(function(item) { return item.reason === "already installed" })
+      root.setStatus(here
+        ? "Nothing to import: " + (plan.length === 1 ? "its one plugin is" : "all " + plan.length + " plugins in it are")
+          + " already installed"
+        : payload.message + ": everything in the file is already here or was skipped", false)
       return
     }
     root.importPreview = payload
@@ -1194,6 +1261,11 @@ Item {
       event.accepted = true
       return
     }
+    if (root.importPicking) {
+      root.exportsKey(event)
+      event.accepted = true
+      return
+    }
     if (root.confirmingRemove || root.confirmingImport || root.confirmingRollback) {
       confirm.handleKey(event)
       event.accepted = true
@@ -1218,6 +1290,7 @@ Item {
     else if (t === "d" || key === Qt.Key_Delete) root.askRemove()
     else if (t === "a" || t === "/") urlField.forceActiveFocus()
     else if (t === "x") root.exportPlugins()
+    else if (t === "I") root.findExports()
     else if (t === "o") root.openRepo()
     else if (t === "r") root.refresh()
     else return
@@ -1251,7 +1324,10 @@ Item {
     stderr: StdioCollector {
       onStreamFinished: if (text.trim().length > 0) console.warn(root.pluginId + " action:", text.trim())
     }
-    onExited: Qt.callLater(root.inspectPending)
+    onExited: Qt.callLater(function() {
+      root.previewPending()
+      root.inspectPending()
+    })
   }
 
   // Avatars, apart from the rest: it waits on the network.
@@ -1423,7 +1499,7 @@ Item {
 
           Button {
             id: addButton
-            anchors.right: exportButton.left
+            anchors.right: importButton.left
             anchors.rightMargin: Style.spacing.controlGap
             anchors.verticalCenter: parent.verticalCenter
             bordered: true
@@ -1432,6 +1508,19 @@ Item {
             text: "Add"
             tooltipText: "Clone the plugin, which stays disabled until you enable it; or preview importing an export file"
             onClicked: root.addPlugin()
+          }
+
+          Button {
+            id: importButton
+            anchors.right: exportButton.left
+            anchors.rightMargin: Style.spacing.controlGap
+            anchors.verticalCenter: parent.verticalCenter
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            text: "Import"
+            tooltipText: "Find an export file in ~ or ~/Downloads and see what importing it would do  (I)"
+            onClicked: root.findExports()
           }
 
           Button {
@@ -1474,7 +1563,7 @@ Item {
             wrapMode: Text.WordWrap
             visible: root.listedOnce && root.plugins.length === 0
             textFormat: Text.PlainText
-            text: "No plugins installed yet.\nPaste the git URL of a plugin above to add one."
+            text: "No plugins installed yet.\nPaste the git URL of a plugin above to add one,\nor Import the plugins you exported on another machine."
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -2135,12 +2224,12 @@ Item {
           anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
           height: root.footerHeight
 
+          // The status comes first: the key hints make room for it.
           Text {
             id: statusText
             anchors.left: parent.left
-            anchors.right: hints.left
-            anchors.rightMargin: Style.spacing.xl
             anchors.verticalCenter: parent.verticalCenter
+            width: Math.min(implicitWidth, parent.width)
             elide: Text.ElideRight
             textFormat: Text.PlainText
             text: root.busy && root.activityLabel ? root.activityLabel + " …" : root.statusMessage
@@ -2149,15 +2238,33 @@ Item {
             font.pixelSize: Style.font.caption
           }
 
-          Text {
+          // As many keys as the status leaves room for. Right to left and
+          // clipped to one row, so whole hints drop off on the left; listed
+          // last to first, the ones with buttons of their own in the header
+          // (import, export, add) go first.
+          Flow {
             id: hints
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            textFormat: Text.PlainText
-            text: "⏎ open  i read  s shortcut  m menu  c check  u update  b roll back  e enable  d remove  a add  x export  esc close"
-            color: root.muted
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+            width: Math.max(0, parent.width - (statusText.text ? statusText.implicitWidth + Style.spacing.xl : 0))
+            height: statusText.implicitHeight
+            clip: true
+            layoutDirection: Qt.RightToLeft
+            spacing: Style.spacing.lg
+
+            Repeater {
+              model: ["esc close", "⏎ open", "i read", "s shortcut", "m menu", "c check", "u update", "b roll back",
+                      "e enable", "d remove", "a add", "x export", "I import"]
+
+              Text {
+                required property string modelData
+                textFormat: Text.PlainText
+                text: modelData
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
           }
         }
       }
@@ -2817,6 +2924,173 @@ Item {
                   fontFamily: root.fontFamily
                   text: root.keyCheck && root.keyCheck.ok && root.keyCheck.taken ? "Take over" : "Save"
                   onClicked: root.saveBind()
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // ------------------------------------------------------------ import
+      // The export files the Import button found, to pick the one to preview.
+      Item {
+        id: exportsDialog
+        anchors.fill: parent
+        visible: root.importPicking
+
+        Rectangle {
+          anchors.fill: parent
+          color: Util.alpha(root.background, 0.7)
+
+          MouseArea {
+            anchors.fill: parent
+            onClicked: root.closeExports()
+          }
+        }
+
+        BorderSurface {
+          id: exportsCard
+          width: Math.min(parent.width - Style.space(32), Style.space(560))
+          height: exportsCard.contentTopInset + exportsCard.contentBottomInset + exportsColumn.implicitHeight
+          anchors.centerIn: parent
+          color: root.background
+          borderSpec: Border.flat(root.accent, Style.normalBorderWidth)
+          padding: Style.space(18)
+          radius: root.cornerRadius
+
+          MouseArea {
+            anchors.fill: parent
+            onClicked: keyCatcher.forceActiveFocus()
+          }
+
+          Column {
+            id: exportsColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.topMargin: exportsCard.contentTopInset
+            anchors.leftMargin: exportsCard.contentLeftInset
+            anchors.rightMargin: exportsCard.contentRightInset
+            spacing: Style.spacing.lg
+
+            Text {
+              width: parent.width
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              text: "Import plugins"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: "Export files in ~ and ~/Downloads, newest first. For one elsewhere, type its path in the field."
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Column {
+              id: exportsList
+              width: parent.width
+              spacing: Style.spacing.xxs
+
+              Repeater {
+                model: root.exportFiles
+
+                Rectangle {
+                  id: exportRow
+                  required property var modelData
+                  required property int index
+                  readonly property bool selected: exportRow.index === root.exportIndex
+
+                  width: exportsList.width
+                  height: root.rowHeight
+                  radius: root.cornerRadius
+                  color: exportRow.selected ? root.selectedBackground : "transparent"
+
+                  Column {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.leftMargin: Style.spacing.rowPaddingX
+                    anchors.rightMargin: Style.spacing.rowPaddingX
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.spacing.xxs
+
+                    Text {
+                      width: parent.width
+                      elide: Text.ElideRight
+                      textFormat: Text.PlainText
+                      text: (exportRow.modelData.host || "Another machine") + "  ·  " + exportRow.modelData.count
+                        + (exportRow.modelData.count === 1 ? " plugin" : " plugins")
+                      color: exportRow.selected ? root.selectedText : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                    }
+
+                    Text {
+                      width: parent.width
+                      elide: Text.ElideMiddle
+                      textFormat: Text.PlainText
+                      text: (exportRow.modelData.exportedAt ? "exported " + root.ago(exportRow.modelData.exportedAt) + "  ·  " : "")
+                        + root.homePath(exportRow.modelData.path)
+                      color: root.muted
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onEntered: root.exportIndex = exportRow.index
+                    onClicked: root.pickExport(exportRow.index)
+                  }
+                }
+              }
+            }
+
+            Item {
+              width: parent.width
+              height: exportsButtons.implicitHeight
+
+              Text {
+                anchors.left: parent.left
+                anchors.right: exportsButtons.left
+                anchors.rightMargin: Style.spacing.xl
+                anchors.verticalCenter: parent.verticalCenter
+                elide: Text.ElideRight
+                textFormat: Text.PlainText
+                text: "↑↓ choose   ⏎ preview   esc cancel"
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Row {
+                id: exportsButtons
+                anchors.right: parent.right
+                spacing: Style.spacing.controlGap
+
+                Button {
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  text: "Cancel"
+                  onClicked: root.closeExports()
+                }
+
+                Button {
+                  bordered: true
+                  foreground: root.accent
+                  fontFamily: root.fontFamily
+                  text: "Preview"
+                  onClicked: root.pickExport(root.exportIndex)
                 }
               }
             }
