@@ -694,15 +694,29 @@ run_stock() {
 
 # An update records the commit and version the plugin was on, for a rollback.
 cmd_update() {
-  local id="${1:-}" dir before after version entry
+  local id="${1:-}" dir before after version entry out moved
   require_managed "$id"
   dir="$PLUGINS_DIR/$id"
   before=$(git -C "$dir" rev-parse HEAD 2>/dev/null)
   version=$(jq -r '.version // empty' "$dir/manifest.json" 2>/dev/null)
-  run_stock "" "$id" omarchy-plugin-update "$id" --yes || return 1
+  after=""
+  # The reply is built here rather than by run_stock, because whether the
+  # shell has to restart is only known once the new HEAD is in hand.
+  if ! out=$(omarchy-plugin-update "$id" --yes 2>&1 </dev/null); then
+    reply false "$(last_line "$out")" "$out" "$(jq -cn --arg id "$id" '{id: $id}')"
+    return 1
+  fi
   after=$(git -C "$dir" rev-parse HEAD 2>/dev/null)
+  moved=false
+  [[ -n $before && $before != "$after" ]] && moved=true
+  # `rescanPlugins` re-reads manifests, but not the QML behind them: an
+  # overlay, a bar widget or a service keeps running the code it was loaded
+  # with until the shell process restarts. Code that has actually moved is
+  # otherwise invisible, which reads as the update having silently failed.
+  reply true "$(last_line "$out")" "$out" \
+    "$(jq -cn --arg id "$id" --argjson restart "$moved" '{id: $id, restart: $restart}')"
   entry=$(check_one "$id" 0)
-  if [[ -n $before && $before != "$after" ]]; then
+  if [[ $moved == true ]]; then
     update_cache --arg id "$id" --argjson e "$entry" --arg from "$before" --arg to "$after" \
       --arg version "$version" --arg now "$(date -Iseconds)" '
       .plugins[$id] = $e
@@ -741,7 +755,8 @@ cmd_rollback() {
 
   update_cache --arg id "$id" --argjson e "$(check_one "$id" 0)" 'del(.history[$id]) | .plugins[$id] = $e'
   omarchy-shell shell rescanPlugins >/dev/null 2>&1
-  reply true "Rolled back $name to $(git -C "$dir" rev-parse --short HEAD)" "" "$(jq -cn --arg id "$id" '{id: $id}')"
+  reply true "Rolled back $name to $(git -C "$dir" rev-parse --short HEAD)" "" \
+    "$(jq -cn --arg id "$id" '{id: $id, restart: true}')"
 }
 
 cmd_remove() {
@@ -1514,8 +1529,12 @@ cmd_run() {
   rm -f "$CACHE_DIR/running.json"
 
   if [[ -z ${PLUGIN_MANAGER_NO_SUMMON:-} ]]; then
-    if [[ $kind == self-update ]] &&
-      jq -e '.ok and (.message | test("^(Updated|Rolled back)"))' >/dev/null 2>&1 <<<"$out"; then
+    # Self-update always restarts; any other action says so with `restart`,
+    # which an update sets when the checkout actually moved. Either way the
+    # resummon below brings the manager back to show the result.
+    if { [[ $kind == self-update ]] &&
+      jq -e '.ok and (.message | test("^(Updated|Rolled back)"))' >/dev/null 2>&1 <<<"$out"; } ||
+      jq -e '.ok and (.restart == true)' >/dev/null 2>&1 <<<"$out"; then
       omarchy-restart-shell >/dev/null 2>&1 || true
     fi
     resummon "$(jq -cn --arg seq "$seq" '{resume: $seq}')"

@@ -134,9 +134,15 @@ brings in: the commits, the files it changes with their added and removed
 lines, and the diff itself (up to 3000 lines). Nothing changes until you
 confirm with `⏎` or **Update**; `Esc` leaves the plugin as it is.
 
-When the manager updates **itself**, the shell restarts afterwards. A running
-shell keeps the old version of the manager until it restarts, so that is the
-only way the new version loads.
+An update that actually moved the plugin restarts the shell afterwards, and
+summons the manager back to show the result. A rescan re-reads manifests but
+not the QML behind them, so a running shell keeps the code it loaded until it
+restarts — without this, new code sits on disk doing nothing and the update
+looks as though it silently failed. An update with nothing to fetch does not
+restart anything.
+
+This has always been true of the manager updating **itself**; it is true of
+every plugin.
 
 ### Rolling an update back
 

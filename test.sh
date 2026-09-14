@@ -30,12 +30,14 @@ mkdir -p "$PLUGINS"
 #   what was enabled in $SHELL_ENABLED, and logs every call to $SHELL_LOG;
 # - hyprctl reports the bindings in $HYPR_BINDS and the errors in $HYPR_ERRORS,
 #   and logs every call to $HYPR_LOG;
-# - omarchy-notification-send logs every notification to $NOTIFY_LOG.
+# - omarchy-notification-send logs every notification to $NOTIFY_LOG;
+# - omarchy logs every call to $OMARCHY_LOG, so a shell restart is observed
+#   rather than performed.
 mkdir -p "$SANDBOX/bin"
 export SHELL_LOG="$SANDBOX/shell.log" SHELL_ENABLED="$SANDBOX/enabled"
 export HYPR_LOG="$SANDBOX/hyprctl.log" HYPR_BINDS="$SANDBOX/binds.json" HYPR_ERRORS="$SANDBOX/configerrors"
-export NOTIFY_LOG="$SANDBOX/notify.log"
-touch "$SHELL_LOG" "$SHELL_ENABLED" "$HYPR_LOG" "$HYPR_ERRORS" "$NOTIFY_LOG"
+export NOTIFY_LOG="$SANDBOX/notify.log" OMARCHY_LOG="$SANDBOX/omarchy.log"
+touch "$SHELL_LOG" "$SHELL_ENABLED" "$HYPR_LOG" "$HYPR_ERRORS" "$NOTIFY_LOG" "$OMARCHY_LOG"
 echo '[]' >"$HYPR_BINDS"
 cat >"$SANDBOX/bin/omarchy-shell" <<'SHIM'
 #!/bin/bash
@@ -76,7 +78,16 @@ cat >"$SANDBOX/bin/omarchy-notification-send" <<'SHIM'
 #!/bin/bash
 printf '%s\n' "$*" >>"$NOTIFY_LOG"
 SHIM
-chmod +x "$SANDBOX/bin/omarchy-shell" "$SANDBOX/bin/hyprctl" "$SANDBOX/bin/omarchy-notification-send"
+# `omarchy restart shell` would restart the real desktop shell, which is
+# exactly what this file promises not to touch.
+cat >"$SANDBOX/bin/omarchy" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$*" >>"$OMARCHY_LOG"
+SHIM
+cp "$SANDBOX/bin/omarchy" "$SANDBOX/bin/omarchy-restart-shell"
+chmod +x "$SANDBOX/bin/omarchy-shell" "$SANDBOX/bin/hyprctl" \
+  "$SANDBOX/bin/omarchy-notification-send" "$SANDBOX/bin/omarchy" \
+  "$SANDBOX/bin/omarchy-restart-shell"
 export PATH="$SANDBOX/bin:$PATH"
 
 passed=0
@@ -216,6 +227,11 @@ out=$("$PM" update "$SELF_ID")
 check "the manager may update itself" '.message | test("itself") | not' "$out"
 out=$("$PM" update test.alpha)
 check "update succeeds" '.ok == true and .id == "test.alpha"' "$out"
+# rescanPlugins re-reads manifests but not the QML behind them, so code that
+# has actually moved is only live after the shell process restarts.
+check "an update that moved the plugin asks for a restart" '.restart == true' "$out"
+out=$("$PM" update test.alpha)
+check "an update with nothing to fetch does not" '.restart == false' "$out"
 out=$("$PM" list)
 check "after update alpha is at 1.1.0 and no longer behind" \
   '.plugins[] | select(.id == "test.alpha") | .version == "1.1.0" and .update.behind == 0' "$out"
