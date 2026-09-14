@@ -73,7 +73,7 @@ omarchy-shell shell toggle io.github.kimm-stensborg.plugin-manager '{}'
 | `d` / `Del` | remove it (asks first) |
 | `a` / `/` | type a git URL to add, or an export file to import; `⏎` goes, `Esc` leaves the field |
 | `x` | export your plugins to a file |
-| `I` | import: find an export file in `~` or `~/Downloads` and preview it |
+| `t` | transfer: export your plugins, or import an export file from `~` or `~/Downloads` |
 | `o` | open its repository in the browser |
 | `r` | reload the list |
 | `Esc` | close |
@@ -88,9 +88,12 @@ For every plugin:
   background into `~/.cache/omarchy/plugin-manager/avatars`, once, and again
   after a week
 - whether it is enabled
-- its remote, branch, commit and last commit
+- where it comes from, under *Source*: the repository, which opens in the
+  browser; click the header for the branch, last commit, id and path, which
+  opens in the file manager
 - **how it opens**: its shortcuts, its entries in the Omarchy menu, and its
-  place in the bar
+  place in the bar. Click the shortcut or the menu entry to add, change or
+  remove it
 - when it was last updated here, and what a rollback would go back to
 
 Problems are called out: a manifest the validator rejects, local changes that
@@ -190,7 +193,7 @@ background has nothing to open, and a disabled one has to be enabled first.
 
 ### Giving a plugin a shortcut
 
-`s`, or **Add**/**Change** beside the shortcut in the details, proposes a free
+`s`, or clicking the shortcut in the details, proposes a free
 combination made from the plugin's name. It tries the initials first, then the
 other letters, each with `SUPER + ALT`, `SUPER + CTRL`, `SUPER + CTRL + SHIFT`
 and `SUPER + SHIFT + ALT`. Type over it if you want something else, or press
@@ -216,7 +219,8 @@ binding.
 
 ### Putting a plugin in the menu
 
-`m`, or **Menu…**, puts an entry for the plugin into the Omarchy menu. It
+`m`, or clicking the menu entry in the details, puts an entry for the plugin
+into the Omarchy menu. It
 goes under *Setup › Plugins* unless you pick another place: the top level,
 *Apps*, *Setup*, *System* or *Trigger*. The label, description and icon start
 out as the plugin's own name, description and the puzzle glyph, and a preview
@@ -252,13 +256,14 @@ manager keeps to:
 
 ## Export and import
 
-`x` writes every plugin to `~/omarchy-plugins-<host>-<date>.json`. Copy that
-file to the other machine — into its home folder or `~/Downloads` — install
-the Plugin Manager there and press **Import** (`I`). It finds the export files
-in both folders: a single one opens straight away, several give a list to
-pick from, newest first. A file kept anywhere else works too: type its path
-into the add field and press `⏎`. A preview lists what will be installed and
-what is skipped, and nothing happens until you confirm it.
+**Transfer** (`t`) is where plugins move between machines. **Export** there,
+or `x` anywhere, writes every plugin to `~/omarchy-plugins-<host>-<date>.json`.
+Copy that file to the other machine — into its home folder or `~/Downloads` —
+install the Plugin Manager there and open **Transfer**: it lists the export
+files in both folders, newest first, and marks one made on this machine. A
+file kept anywhere else works too: type its path into the add field and press
+`⏎`. Picking a file shows what will be installed and what is skipped, and
+nothing happens until you confirm it.
 
 For each plugin the file records:
 

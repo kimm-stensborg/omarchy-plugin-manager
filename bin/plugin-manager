@@ -1296,7 +1296,7 @@ cmd_export() {
 # The export files there are to import: omarchy-plugins-*.json in the home
 # folder, where export writes them, and in the download folder, where a copied
 # one tends to land. Only real exports, newest first, each with the machine it
-# came from, when it was made and how many plugins it holds.
+# came from (local: this one), when it was made and how many plugins it holds.
 cmd_exports() {
   local downloads dir file entry entries=() dirs=("$HOME")
   downloads=$(xdg-user-dir DOWNLOAD 2>/dev/null)
@@ -1307,9 +1307,10 @@ cmd_exports() {
   for dir in "${dirs[@]}"; do
     for file in "$dir"/omarchy-plugins-*.json; do
       [[ -f $file ]] || continue
-      entry=$(jq -c --arg format "$EXPORT_FORMAT" --arg path "$file" --argjson modified "$(stat -c %Y "$file")" '
+      entry=$(jq -c --arg format "$EXPORT_FORMAT" --arg path "$file" --arg here "$(uname -n)" \
+        --argjson modified "$(stat -c %Y "$file")" '
         select(type == "object" and .format == $format and .version == 1)
-        | {path: $path, host: (.host // ""), exportedAt: (.exportedAt // ""),
+        | {path: $path, host: (.host // ""), local: (.host == $here), exportedAt: (.exportedAt // ""),
            count: ((.plugins // []) | length), modified: $modified}' "$file" 2>/dev/null)
       [[ -n $entry ]] && entries+=("$entry")
     done

@@ -54,13 +54,14 @@ Item {
   property bool confirmingImport: false
   property var importPreview: null
 
-  // The export files the Import button found, when there is more than one to
-  // pick from; a single one goes straight to its preview, once the search's
-  // process is done.
-  property bool importPicking: false
+  // The Transfer dialog: export these plugins, or import one of the export
+  // files it found in ~ and ~/Downloads.
+  property bool transferring: false
   property var exportFiles: []
   property int exportIndex: 0
-  property string pendingPreview: ""
+
+  // The SOURCE section of the details: folded to the repository, or all of it.
+  property bool sourceOpen: false
 
   // An update waiting on its review: the reply of `plugin-manager review`.
   property bool reviewing: false
@@ -253,7 +254,7 @@ Item {
     root.confirmingImport = false
     root.confirmingRollback = false
     root.importPreview = null
-    root.importPicking = false
+    root.transferring = false
     root.reviewing = false
     root.review = null
     root.inspecting = false
@@ -394,7 +395,7 @@ Item {
       root.showImportPreview(payload)
       return
     } else if (kind === "exports") {
-      root.showExports(payload)
+      root.showTransfer(payload)
       return
     } else if (kind === "review") {
       root.showReview(payload)
@@ -731,52 +732,40 @@ Item {
     root.runAction(["export"], "Exporting plugins", "", "export", false)
   }
 
-  // The Import button: look for export files in ~ and ~/Downloads. Also
-  // callable over IPC: `omarchy-shell shell call <id> findExports x`.
-  function findExports() {
+  // The Transfer button: find the export files in ~ and ~/Downloads, then
+  // open the dialog that exports or imports. Also callable over IPC:
+  // `omarchy-shell shell call <id> openTransfer x`.
+  function openTransfer() {
     root.runAction(["exports"], "Looking for export files", "", "exports", false)
   }
 
-  function showExports(payload) {
-    var files = payload.files || []
-    if (files.length === 0) {
-      root.setStatus(payload.message + "; type the path of one in the field", false)
-      urlField.forceActiveFocus()
-      return
-    }
-    if (files.length === 1) {
-      root.pendingPreview = files[0].path
-      // Whichever comes last, this or the process exiting, starts it.
-      Qt.callLater(root.previewPending)
-      return
-    }
-    root.exportFiles = files.slice(0, 8)
+  function showTransfer(payload) {
+    root.exportFiles = (payload.files || []).slice(0, 8)
     root.exportIndex = 0
-    root.importPicking = true
+    root.transferring = true
   }
 
-  function previewPending() {
-    var path = root.pendingPreview
-    if (!path || root.busy || quickProc.running) return
-    root.pendingPreview = ""
-    root.previewImport(path)
+  function closeTransfer() {
+    root.transferring = false
+    keyCatcher.forceActiveFocus()
   }
 
   function pickExport(index) {
     var file = root.exportFiles[index]
-    root.closeExports()
+    root.closeTransfer()
     if (file) root.previewImport(file.path)
   }
 
-  function closeExports() {
-    root.importPicking = false
-    keyCatcher.forceActiveFocus()
+  function exportFromTransfer() {
+    root.closeTransfer()
+    root.exportPlugins()
   }
 
-  function exportsKey(event) {
+  function transferKey(event) {
     var key = event.key
     var t = event.text
-    if (key === Qt.Key_Escape) root.closeExports()
+    if (key === Qt.Key_Escape) root.closeTransfer()
+    else if (t === "x") root.exportFromTransfer()
     else if (key === Qt.Key_Up || t === "k") root.exportIndex = Math.max(0, root.exportIndex - 1)
     else if (key === Qt.Key_Down || t === "j") root.exportIndex = Math.min(root.exportFiles.length - 1, root.exportIndex + 1)
     else if (key === Qt.Key_Return || key === Qt.Key_Enter) root.pickExport(root.exportIndex)
@@ -1006,50 +995,39 @@ Item {
     return null
   }
 
-  // The shortcut and menu section under the details. What the manager can
-  // move (what it set, or the plugin's installer) gets Change and Remove;
-  // otherwise Add, which leaves anything set elsewhere alone and adds another.
-  // A plugin with nothing to open shows only what it already has.
+  // The shortcut and the menu entry, side by side under the details. With
+  // something to open, each is a click away from its dialog, which also moves
+  // or removes what the manager looks after and adds another beside anything
+  // set elsewhere; one not set yet offers to add it. A plugin with nothing to
+  // open shows only what it already has.
   function openers(p) {
     if (!p) return []
     var opens = p.opens || { shortcuts: [], menu: [] }
     var canOpen = !!p.openCommand
-    function actions(own, kind, what) {
-      if (!canOpen) return []
-      var key = kind === "shortcut" ? "s" : "m"
-      return own
-        ? [{ text: "Change", kind: kind, tip: "Change the " + what + "  (" + key + ")" },
-           { text: "Remove", kind: kind + "-remove", tip: "Remove the " + what }]
-        : [{ text: "Add", kind: kind, tip: "Add a " + what + " that opens this plugin  (" + key + ")" }]
-    }
     // A shortcut's own description only where it tells something: beside
     // another shortcut, or when it is more than the plugin's name again.
     var many = opens.shortcuts.length > 1
-    var rows = [
-      { title: "Shortcut",
+    var cells = [
+      { title: "Shortcut", kind: canOpen ? "shortcut" : "", add: "Add a shortcut",
         lines: opens.shortcuts.map(function(s) {
           var note = (s.description || "").trim()
           return { keys: s.keys.split(" + "),
                    note: many || note.toLowerCase() !== (p.name || "").toLowerCase() ? note : "",
                    override: s.addedBy === "manager",
                    inactive: s.active === false }
-        }),
-        actions: actions(root.managedShortcut(p), "shortcut", "shortcut") },
-      { title: "Menu",
+        }) },
+      { title: "Menu", kind: canOpen ? "menu" : "", add: "Add to the menu",
         lines: opens.menu.map(function(m) {
           return { path: m.path.split(" › "), override: m.addedBy === "manager" }
-        }),
-        actions: actions(root.managedMenu(p), "menu", "menu entry") }
+        }) }
     ]
-    return rows.filter(function(r) { return canOpen || r.lines.length > 0 })
-               .map(function(r) { if (!r.lines.length) r.lines = [{ none: true }]; return r })
+    return cells.filter(function(c) { return canOpen || c.lines.length > 0 })
+                .map(function(c) { if (!c.lines.length) c.lines = [{ none: true }]; return c })
   }
 
   function openerAction(kind) {
     if (kind === "shortcut") root.askBind()
-    else if (kind === "shortcut-remove") root.removeBind()
     else if (kind === "menu") root.askMenu()
-    else if (kind === "menu-remove") root.removeMenu()
   }
 
   // "setup.plugin.kappa" sits under "setup.plugin"; a top-level id under "".
@@ -1224,20 +1202,31 @@ Item {
     return list
   }
 
-  // Where it comes from, under a header of its own at the bottom.
-  function sourceFields(p) {
+  // Where it comes from, under a header of its own at the bottom: folded to
+  // the repository until the header is clicked. The repository opens in the
+  // browser and the path in the file manager.
+  function sourceFields(p, open) {
     var list = []
     if (!p) return list
-    function add(label, value) { if (value) list.push({ label: label, value: String(value) }) }
+    function add(label, value, action) {
+      if (value) list.push({ label: label, value: String(value), action: action || "" })
+    }
+    var web = root.webUrl(p)
+    if (p.git) add("Repository", web.replace(/^https?:\/\//, "") || p.git.remote, web ? "repo" : "")
+    if (!open) return list
     if (p.git) {
-      add("Repository", root.webUrl(p).replace(/^https?:\/\//, "") || p.git.remote)
       add("Branch", p.git.branch + (p.git.commit ? " @ " + p.git.commit : ""))
       add("Last commit", p.git.subject + (p.git.date ? "  ·  " + p.git.date.slice(0, 10) : ""))
     }
     add("Id", p.id)
     if (p.manifestId && p.manifestId !== p.id) add("Manifest id", p.manifestId)
-    add("Path", root.homePath(p.path))
+    add("Path", root.homePath(p.path), "folder")
     return list
+  }
+
+  function fieldAction(action) {
+    if (action === "repo") root.openRepo()
+    else if (action === "folder") root.openFolder(root.current ? root.current.path : "")
   }
 
   function handleKey(event) {
@@ -1261,8 +1250,8 @@ Item {
       event.accepted = true
       return
     }
-    if (root.importPicking) {
-      root.exportsKey(event)
+    if (root.transferring) {
+      root.transferKey(event)
       event.accepted = true
       return
     }
@@ -1290,7 +1279,7 @@ Item {
     else if (t === "d" || key === Qt.Key_Delete) root.askRemove()
     else if (t === "a" || t === "/") urlField.forceActiveFocus()
     else if (t === "x") root.exportPlugins()
-    else if (t === "I") root.findExports()
+    else if (t === "t") root.openTransfer()
     else if (t === "o") root.openRepo()
     else if (t === "r") root.refresh()
     else return
@@ -1324,10 +1313,7 @@ Item {
     stderr: StdioCollector {
       onStreamFinished: if (text.trim().length > 0) console.warn(root.pluginId + " action:", text.trim())
     }
-    onExited: Qt.callLater(function() {
-      root.previewPending()
-      root.inspectPending()
-    })
+    onExited: Qt.callLater(root.inspectPending)
   }
 
   // Avatars, apart from the rest: it waits on the network.
@@ -1458,19 +1444,39 @@ Item {
             font.bold: true
           }
 
-          Text {
+          // What there is and when it was checked, and a quiet button to check
+          // it all again; pulled out by its padding so its text meets the edge.
+          Row {
             anchors.right: parent.right
+            anchors.rightMargin: -Style.spacing.md
             anchors.verticalCenter: parent.verticalCenter
-            textFormat: Text.PlainText
-            color: root.updateCount > 0 ? root.accent : root.muted
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            text: {
-              var parts = [root.plugins.length + " installed"]
-              if (root.updateCount > 0)
-                parts.push(root.updateCount === 1 ? "1 update" : root.updateCount + " updates")
-              parts.push(root.checkedAt ? "checked " + root.ago(root.checkedAt) : "not checked yet")
-              return parts.join("  ·  ")
+            spacing: Style.spacing.xs
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              color: root.updateCount > 0 ? root.accent : root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              text: {
+                var parts = [root.plugins.length + " installed"]
+                if (root.updateCount > 0)
+                  parts.push(root.updateCount === 1 ? "1 update" : root.updateCount + " updates")
+                parts.push(root.checkedAt ? "checked " + root.ago(root.checkedAt) : "not checked yet")
+                return parts.join("  ·  ")
+              }
+            }
+
+            Button {
+              anchors.verticalCenter: parent.verticalCenter
+              foreground: root.muted
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              horizontalPadding: Style.spacing.md
+              verticalPadding: Style.spacing.xxs
+              text: "Check all"
+              tooltipText: "Look upstream for updates to every plugin  (C)"
+              onClicked: root.checkAll()
             }
           }
         }
@@ -1499,7 +1505,7 @@ Item {
 
           Button {
             id: addButton
-            anchors.right: importButton.left
+            anchors.right: transferButton.left
             anchors.rightMargin: Style.spacing.controlGap
             anchors.verticalCenter: parent.verticalCenter
             bordered: true
@@ -1511,41 +1517,15 @@ Item {
           }
 
           Button {
-            id: importButton
-            anchors.right: exportButton.left
-            anchors.rightMargin: Style.spacing.controlGap
-            anchors.verticalCenter: parent.verticalCenter
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            text: "Import"
-            tooltipText: "Find an export file in ~ or ~/Downloads and see what importing it would do  (I)"
-            onClicked: root.findExports()
-          }
-
-          Button {
-            id: exportButton
-            anchors.right: checkAllButton.left
-            anchors.rightMargin: Style.spacing.controlGap
-            anchors.verticalCenter: parent.verticalCenter
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            text: "Export"
-            tooltipText: "Write your plugins to a file for another Omarchy install  (x)"
-            onClicked: root.exportPlugins()
-          }
-
-          Button {
-            id: checkAllButton
+            id: transferButton
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             bordered: true
             foreground: root.foreground
             fontFamily: root.fontFamily
-            text: "Check all"
-            tooltipText: "Look upstream for updates to every plugin  (C)"
-            onClicked: root.checkAll()
+            text: "Transfer"
+            tooltipText: "Export your plugins to a file, or import one from another machine  (t)"
+            onClicked: root.openTransfer()
           }
         }
 
@@ -1563,7 +1543,7 @@ Item {
             wrapMode: Text.WordWrap
             visible: root.listedOnce && root.plugins.length === 0
             textFormat: Text.PlainText
-            text: "No plugins installed yet.\nPaste the git URL of a plugin above to add one,\nor Import the plugins you exported on another machine."
+            text: "No plugins installed yet.\nPaste the git URL of a plugin above to add one,\nor Transfer them over from another machine."
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -1914,40 +1894,61 @@ Item {
                     font.pixelSize: Style.font.caption
                   }
 
+                  // A value that opens something reads as a link.
                   Text {
                     width: detailsColumn.width - root.labelWidth - Style.spacing.lg
                     wrapMode: Text.WrapAnywhere
                     textFormat: Text.PlainText
                     text: fieldRow.modelData.value
-                    color: root.foreground
+                    color: fieldRow.modelData.action ? root.accent : root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
+                    font.underline: fieldLink.containsMouse
+
+                    MouseArea {
+                      id: fieldLink
+                      // As wide as the text, not the rest of the row.
+                      width: parent.contentWidth
+                      height: parent.height
+                      enabled: !!fieldRow.modelData.action
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.fieldAction(fieldRow.modelData.action)
+                    }
                   }
                 }
               }
 
-              // Shortcut and menu: what there is, and the buttons that manage it.
-              Repeater {
-                id: openersRepeater
-                model: root.openers(root.current)
+              // Shortcut and menu side by side, each a click away from its
+              // dialog (see openers). Wider than the column by the cells'
+              // padding, so their text lines up with the rest.
+              Row {
+                id: openersRow
+                x: -Style.spacing.sm
+                width: parent.width + Style.spacing.sm * 2
+                visible: openersRepeater.count > 0
+                spacing: Style.spacing.md
 
-                // Each one closed off by a divider of its own.
-                Column {
-                  id: openerRow
-                  required property var modelData
-                  width: detailsColumn.width
-                  spacing: detailsColumn.spacing
+                Repeater {
+                  id: openersRepeater
+                  model: root.openers(root.current)
 
-                  Item {
-                    width: parent.width
-                    height: Math.max(openerText.implicitHeight, openerButtons.implicitHeight)
+                  Rectangle {
+                    id: openerRow
+                    required property var modelData
+                    readonly property bool editable: openerRow.modelData.kind !== ""
+
+                    width: (openersRow.width - openersRow.spacing * (openersRepeater.count - 1)) / openersRepeater.count
+                    height: openerText.implicitHeight + Style.spacing.sm * 2
+                    radius: root.cornerRadius
+                    color: openerMouse.containsMouse ? Util.alpha(root.foreground, 0.06) : "transparent"
 
                     Column {
                       id: openerText
                       anchors.left: parent.left
-                      anchors.right: openerButtons.left
-                      anchors.rightMargin: Style.spacing.lg
-                      anchors.verticalCenter: parent.verticalCenter
+                      anchors.right: parent.right
+                      anchors.top: parent.top
+                      anchors.margins: Style.spacing.sm
                       spacing: Style.spacing.xxs
 
                       Text {
@@ -1974,8 +1975,8 @@ Item {
                             height: root.tagHeight
                             verticalAlignment: Text.AlignVCenter
                             textFormat: Text.PlainText
-                            text: "none"
-                            color: root.muted
+                            text: openerRow.editable ? openerRow.modelData.add : "none"
+                            color: openerRow.editable ? root.accent : root.muted
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.bodySmall
                           }
@@ -2066,37 +2067,23 @@ Item {
                       }
                     }
 
-                    Row {
-                      id: openerButtons
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.spacing.controlGap
-
-                      Repeater {
-                        model: openerRow.modelData.actions
-
-                        Button {
-                          required property var modelData
-                          bordered: true
-                          foreground: root.foreground
-                          fontFamily: root.fontFamily
-                          fontSize: Style.font.caption
-                          horizontalPadding: Style.spacing.md
-                          verticalPadding: Style.spacing.xxs
-                          text: modelData.text
-                          tooltipText: modelData.tip
-                          onClicked: root.openerAction(modelData.kind)
-                        }
-                      }
+                    MouseArea {
+                      id: openerMouse
+                      anchors.fill: parent
+                      enabled: openerRow.editable
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.openerAction(openerRow.modelData.kind)
                     }
                   }
-
-                  Rectangle {
-                    width: parent.width
-                    height: 1
-                    color: root.faint
-                  }
                 }
+              }
+
+              Rectangle {
+                width: parent.width
+                height: 1
+                color: root.faint
+                visible: openersRepeater.count > 0
               }
 
               Repeater {
@@ -2107,15 +2094,24 @@ Item {
               // Where it comes from: the repo, and where it sits on disk.
               // Set off from the facts above by more than their own spacing;
               // the default top padding is the glyph overshoot it reserves.
+              // Clicking it unfolds the rest of the source, or folds it again.
               PanelSectionHeader {
                 topPadding: Math.ceil(fontSize * 0.15) + Style.spacing.md
-                text: "SOURCE"
-                foreground: root.foreground
+                text: "SOURCE  " + (root.sourceOpen ? "" : "")
+                foreground: sourceToggle.containsMouse ? root.accent : root.foreground
                 fontFamily: root.fontFamily
+
+                MouseArea {
+                  id: sourceToggle
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.sourceOpen = !root.sourceOpen
+                }
               }
 
               Repeater {
-                model: root.sourceFields(root.current)
+                model: root.sourceFields(root.current, root.sourceOpen)
                 delegate: fieldDelegate
               }
             }
@@ -2204,17 +2200,7 @@ Item {
                 text: root.current && root.current.enabled ? "Disable" : "Enable"
                 tooltipText: "Switch the plugin on or off  (e)"
                 onClicked: root.toggleEnabled()
-              }
-
-              Button {
-                visible: root.webUrl(root.current) !== ""
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                text: "Open repo"
-                tooltipText: "Open the repository in the browser  (o)"
-                onClicked: root.openRepo()
-              }
-            }
+              }            }
           }
         }
 
@@ -2254,7 +2240,7 @@ Item {
 
             Repeater {
               model: ["esc close", "⏎ open", "i read", "s shortcut", "m menu", "c check", "u update", "b roll back",
-                      "e enable", "d remove", "a add", "x export", "I import"]
+                      "e enable", "d remove", "o repo", "a add", "x export", "t transfer"]
 
               Text {
                 required property string modelData
@@ -2931,12 +2917,13 @@ Item {
         }
       }
 
-      // ------------------------------------------------------------ import
-      // The export files the Import button found, to pick the one to preview.
+      // ---------------------------------------------------------- transfer
+      // Moving plugins between machines: export these, or import one of the
+      // export files found in ~ and ~/Downloads.
       Item {
-        id: exportsDialog
+        id: transferDialog
         anchors.fill: parent
-        visible: root.importPicking
+        visible: root.transferring
 
         Rectangle {
           anchors.fill: parent
@@ -2944,14 +2931,14 @@ Item {
 
           MouseArea {
             anchors.fill: parent
-            onClicked: root.closeExports()
+            onClicked: root.closeTransfer()
           }
         }
 
         BorderSurface {
-          id: exportsCard
+          id: transferCard
           width: Math.min(parent.width - Style.space(32), Style.space(560))
-          height: exportsCard.contentTopInset + exportsCard.contentBottomInset + exportsColumn.implicitHeight
+          height: transferCard.contentTopInset + transferCard.contentBottomInset + transferColumn.implicitHeight
           anchors.centerIn: parent
           color: root.background
           borderSpec: Border.flat(root.accent, Style.normalBorderWidth)
@@ -2964,40 +2951,91 @@ Item {
           }
 
           Column {
-            id: exportsColumn
+            id: transferColumn
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.top: parent.top
-            anchors.topMargin: exportsCard.contentTopInset
-            anchors.leftMargin: exportsCard.contentLeftInset
-            anchors.rightMargin: exportsCard.contentRightInset
+            anchors.topMargin: transferCard.contentTopInset
+            anchors.leftMargin: transferCard.contentLeftInset
+            anchors.rightMargin: transferCard.contentRightInset
             spacing: Style.spacing.lg
 
             Text {
               width: parent.width
               elide: Text.ElideRight
               textFormat: Text.PlainText
-              text: "Import plugins"
+              text: "Transfer plugins"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
               font.bold: true
             }
 
-            Text {
+            Column {
               width: parent.width
-              wrapMode: Text.WordWrap
-              textFormat: Text.PlainText
-              text: "Export files in ~ and ~/Downloads, newest first. For one elsewhere, type its path in the field."
-              color: root.muted
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
+              spacing: Style.spacing.sm
+
+              PanelSectionHeader {
+                text: "EXPORT"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Item {
+                width: parent.width
+                height: Math.max(exportNote.implicitHeight, exportNowButton.implicitHeight)
+
+                Text {
+                  id: exportNote
+                  anchors.left: parent.left
+                  anchors.right: exportNowButton.left
+                  anchors.rightMargin: Style.spacing.lg
+                  anchors.verticalCenter: parent.verticalCenter
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: "Write your plugins to a file in ~, with their places in the bar and their settings, to copy to the other machine."
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Button {
+                  id: exportNowButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  text: "Export"
+                  tooltipText: "Write the export file now  (x)"
+                  onClicked: root.exportFromTransfer()
+                }
+              }
             }
 
             Column {
               id: exportsList
               width: parent.width
               spacing: Style.spacing.xxs
+
+              PanelSectionHeader {
+                text: "IMPORT"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Text {
+                width: parent.width
+                bottomPadding: Style.spacing.xs
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: root.exportFiles.length === 0
+                  ? "No export files in ~ or ~/Downloads. Copy one there, or type its path in the field."
+                  : "Export files in ~ and ~/Downloads, newest first. Pick one to preview it."
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
 
               Repeater {
                 model: root.exportFiles
@@ -3025,7 +3063,8 @@ Item {
                       width: parent.width
                       elide: Text.ElideRight
                       textFormat: Text.PlainText
-                      text: (exportRow.modelData.host || "Another machine") + "  ·  " + exportRow.modelData.count
+                      text: (exportRow.modelData.host || "Another machine")
+                        + (exportRow.modelData.local ? " (this machine)" : "") + "  ·  " + exportRow.modelData.count
                         + (exportRow.modelData.count === 1 ? " plugin" : " plugins")
                       color: exportRow.selected ? root.selectedText : root.foreground
                       font.family: root.fontFamily
@@ -3066,7 +3105,7 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 elide: Text.ElideRight
                 textFormat: Text.PlainText
-                text: "↑↓ choose   ⏎ preview   esc cancel"
+                text: root.exportFiles.length > 0 ? "↑↓ choose   ⏎ preview   x export   esc close" : "x export   esc close"
                 color: root.muted
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -3081,11 +3120,12 @@ Item {
                   bordered: true
                   foreground: root.foreground
                   fontFamily: root.fontFamily
-                  text: "Cancel"
-                  onClicked: root.closeExports()
+                  text: "Close"
+                  onClicked: root.closeTransfer()
                 }
 
                 Button {
+                  visible: root.exportFiles.length > 0
                   bordered: true
                   foreground: root.accent
                   fontFamily: root.fontFamily

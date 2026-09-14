@@ -396,6 +396,7 @@ check "exports finds the exports in home and Downloads, newest first" \
   ".ok == true and .message == \"2 export files\" and [.files[].path] == [\"$home_export\", \"$HOME/Downloads/omarchy-plugins-elsewhere-20260901.json\"]" "$out"
 check "exports says where each one came from and what it holds" \
   '.files[1] | .host == "elsewhere" and .exportedAt == "2026-09-01T10:00:00+02:00" and .count == 5' "$out"
+check "exports tells an export made here from one made elsewhere" '.files[0].local == true and .files[1].local == false' "$out"
 rm "$home_export" "$HOME"/Downloads/omarchy-plugins-*.json
 out=$("$PM" exports)
 check "exports with none says where it looked" '.ok == true and .files == [] and .message == "No export files in ~ or ~/Downloads"' "$out"
