@@ -154,7 +154,10 @@ Item {
   readonly property int avatarSize: Math.round(root.rowHeight * 0.6)
   readonly property int cardWidth: Math.min(Style.space(1040), panel.width - Style.gapsOut * 2)
   readonly property int cardHeight: Math.min(Style.space(640), panel.height - Style.gapsOut * 2)
-  readonly property int detailAvatarSize: Math.round(root.avatarSize * 2.4)
+  readonly property int detailAvatarSize: Math.round(root.avatarSize * 1.8)
+  // Between the sections of the details; the kit's spacing tokens top out
+  // at a dozen pixels, which is room within a section, not between them.
+  readonly property int sectionGap: Style.space(14)
 
   // A plugin's author: the GitHub avatar, or initials without one. In each
   // list row, and larger at the head of the details. Inline components do
@@ -1107,22 +1110,20 @@ Item {
     return parts.join("  ·  ")
   }
 
-  // Under the name in the details: who wrote it, and its license.
+  // Under the name in the details: who wrote it, its license, and the kinds
+  // the shell loads it as.
   function byline(p) {
     var parts = []
     if (p && p.author) parts.push("by " + p.author)
     if (p && p.license) parts.push(p.license)
+    if (p && p.kinds && p.kinds.length) parts.push(p.kinds.join(", "))
     return parts.join("  ·  ")
   }
 
-  // The pills under the name: on or off, then the kinds the shell loads it as.
-  function tags(p) {
-    if (!p) return []
-    var list = [p.enabled ? { text: "● enabled", tint: root.accent, textColor: root.accent }
-                          : { text: "○ disabled", tint: root.foreground, textColor: root.foreground }]
-    var kinds = p.kinds || []
-    for (var i = 0; i < kinds.length; i++) list.push({ text: kinds[i], tint: root.foreground, textColor: root.muted })
-    return list
+  // The one pill beside the name: whether it is on.
+  function statusTag(p) {
+    return p && p.enabled ? { text: "● enabled", tint: root.accent, textColor: root.accent }
+                          : { text: "○ disabled", tint: root.foreground, textColor: root.foreground }
   }
 
   // The one action that stands out under the details: the update waiting,
@@ -1172,7 +1173,8 @@ Item {
       if (u.remoteVersion && u.remoteVersion !== p.version) text += "  ·  " + (p.version || "?") + " → " + u.remoteVersion
       return { text: text, color: root.accent }
     }
-    return { text: "Up to date  ·  checked " + root.ago(u.checkedAt), color: root.muted }
+    // Up to date is no news: the header says when everything was checked.
+    return { text: "", color: root.muted }
   }
 
   function warnings(p) {
@@ -1685,11 +1687,12 @@ Item {
               width: details.width
               spacing: root.contentSpacing
 
-              // The head: its author's avatar beside its name and version, who
-              // wrote it, and pills for whether it is on and its kinds.
+              // The head, two lines beside its author's avatar: the name, its
+              // version and whether it is on; then who wrote it, the license
+              // and the kinds.
               Row {
                 width: parent.width
-                spacing: Style.spacing.xl
+                spacing: Style.space(12)
 
                 Avatar {
                   id: detailAvatar
@@ -1704,7 +1707,7 @@ Item {
                 Column {
                   anchors.verticalCenter: parent.verticalCenter
                   width: parent.width - detailAvatar.width - parent.spacing
-                  spacing: Style.spacing.xs
+                  spacing: Style.space(4)
 
                   Row {
                     width: parent.width
@@ -1712,7 +1715,8 @@ Item {
 
                     Text {
                       id: detailName
-                      width: Math.min(implicitWidth, parent.width - detailVersion.implicitWidth - parent.spacing)
+                      width: Math.min(implicitWidth,
+                                      parent.width - detailVersion.implicitWidth - detailStatus.width - parent.spacing * 2)
                       elide: Text.ElideRight
                       textFormat: Text.PlainText
                       text: root.current ? root.current.name : ""
@@ -1731,6 +1735,15 @@ Item {
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                     }
+
+                    Pill {
+                      id: detailStatus
+                      readonly property var tag: root.statusTag(root.current)
+                      anchors.verticalCenter: detailName.verticalCenter
+                      text: tag.text
+                      tint: tag.tint
+                      textColor: tag.textColor
+                    }
                   }
 
                   Text {
@@ -1743,32 +1756,15 @@ Item {
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                   }
-
-                  // A little apart from the name and byline above.
-                  Flow {
-                    width: parent.width
-                    topPadding: Style.spacing.xs
-                    spacing: Style.spacing.sm
-
-                    Repeater {
-                      model: root.tags(root.current)
-
-                      Pill {
-                        required property var modelData
-                        text: modelData.text
-                        tint: modelData.tint
-                        textColor: modelData.textColor
-                      }
-                    }
-                  }
                 }
               }
 
-              // Set off from the head, and airy enough to read when it wraps.
+              // A section apart from the head, and airy enough to read when it
+              // wraps. The padding tops the column's spacing up to sectionGap.
               Text {
                 width: parent.width
                 visible: text !== ""
-                topPadding: Style.spacing.sm
+                topPadding: root.sectionGap - detailsColumn.spacing
                 lineHeight: 1.2
                 wrapMode: Text.WordWrap
                 textFormat: Text.PlainText
@@ -1778,9 +1774,11 @@ Item {
                 font.pixelSize: Style.font.body
               }
 
-              // How it stands with upstream, and a quiet button to ask again.
+              // How it stands with upstream when there is news -- an update,
+              // an error, never checked -- and a quiet button to ask again.
               Row {
                 width: parent.width
+                visible: root.updateLine(root.current).text !== ""
                 spacing: Style.spacing.md
 
                 Text {
@@ -1875,10 +1873,17 @@ Item {
                 }
               }
 
-              Rectangle {
+              // The rule between sections, with sectionGap on either side.
+              Item {
                 width: parent.width
-                height: 1
-                color: root.faint
+                height: (root.sectionGap - detailsColumn.spacing) * 2 + 1
+
+                Rectangle {
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width
+                  height: 1
+                  color: root.faint
+                }
               }
 
               // One fact: its label, and its value wrapping under itself.
@@ -1890,7 +1895,10 @@ Item {
                   required property var modelData
                   spacing: Style.spacing.lg
 
+                  // On the value's first baseline, not its top: the label is
+                  // the smaller of the two.
                   Text {
+                    anchors.baseline: fieldValue.baseline
                     width: root.labelWidth
                     textFormat: Text.PlainText
                     text: fieldRow.modelData.label
@@ -1901,6 +1909,7 @@ Item {
 
                   // A value that opens something reads as a link.
                   Text {
+                    id: fieldValue
                     width: detailsColumn.width - root.labelWidth - Style.spacing.lg
                     wrapMode: Text.WrapAnywhere
                     textFormat: Text.PlainText
@@ -2084,24 +2093,33 @@ Item {
                 }
               }
 
-              Rectangle {
+              Item {
                 width: parent.width
-                height: 1
-                color: root.faint
+                height: (root.sectionGap - detailsColumn.spacing) * 2 + 1
                 visible: openersRepeater.count > 0
+
+                Rectangle {
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width
+                  height: 1
+                  color: root.faint
+                }
               }
 
               Repeater {
+                id: factsRepeater
                 model: root.facts(root.current)
                 delegate: fieldDelegate
               }
 
               // Where it comes from: the repo, and where it sits on disk.
-              // Set off from the facts above by more than their own spacing;
-              // the default top padding is the glyph overshoot it reserves.
-              // Clicking it unfolds the rest of the source, or folds it again.
+              // A section of its own: sectionGap from any facts above, just
+              // the rule's gap when it follows the rule. The default top
+              // padding is the glyph overshoot it reserves. Clicking it
+              // unfolds the rest of the source, or folds it again.
               PanelSectionHeader {
-                topPadding: Math.ceil(fontSize * 0.15) + Style.spacing.md
+                topPadding: Math.ceil(fontSize * 0.15)
+                  + (factsRepeater.count > 0 ? root.sectionGap - detailsColumn.spacing : 0)
                 text: "SOURCE  " + (root.sourceOpen ? "" : "")
                 foreground: sourceToggle.containsMouse ? root.accent : root.foreground
                 fontFamily: root.fontFamily
