@@ -1530,34 +1530,9 @@ Item {
             font.pixelSize: Style.font.body
           }
 
-          // Moving plugins between machines, under the list: Import… picks an
-          // export file, Export writes one to ~.
-          Row {
-            id: listActions
-            anchors.left: parent.left
-            anchors.bottom: parent.bottom
-            spacing: Style.spacing.controlGap
-
-            Button {
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              text: "Import…"
-              tooltipText: "Pick an export file and choose which of its plugins to install  (I)"
-              onClicked: root.pickImport()
-            }
-
-            Button {
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              text: "Export"
-              tooltipText: "Write your plugins to a file in ~ for another Omarchy install  (x)"
-              onClicked: root.exportPlugins()
-            }
-          }
-
           ListView {
             id: pluginList
-            anchors { left: parent.left; top: parent.top; bottom: listActions.top; bottomMargin: root.contentSpacing }
+            anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
             width: Math.round(parent.width * 0.36)
             clip: true
             spacing: Style.spacing.xxs
@@ -2235,14 +2210,45 @@ Item {
         Item {
           id: footer
           anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
-          height: root.footerHeight
+          height: Math.max(root.footerHeight, footerActions.implicitHeight)
 
-          // The status comes first: the key hints make room for it.
+          // The width left of the line once Import… and Export have theirs.
+          readonly property real free: width - (footerActions.x + footerActions.width) - Style.spacing.xl
+
+          // Moving plugins between machines, at the very bottom: Import…
+          // picks an export file, Export writes one to ~. Pulled out by the
+          // buttons' padding, so their text meets the card's edge.
+          Row {
+            id: footerActions
+            anchors.left: parent.left
+            anchors.leftMargin: -Style.spacing.controlPaddingX
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.spacing.xxs
+
+            Button {
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              text: "Import…"
+              tooltipText: "Pick an export file and choose which of its plugins to install  (I)"
+              onClicked: root.pickImport()
+            }
+
+            Button {
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              text: "Export"
+              tooltipText: "Write your plugins to a file in ~ for another Omarchy install  (x)"
+              onClicked: root.exportPlugins()
+            }
+          }
+
+          // The status comes next: the key hints make room for it.
           Text {
             id: statusText
-            anchors.left: parent.left
+            anchors.left: footerActions.right
+            anchors.leftMargin: Style.spacing.xl
             anchors.verticalCenter: parent.verticalCenter
-            width: Math.min(implicitWidth, parent.width)
+            width: Math.max(0, Math.min(implicitWidth, footer.free))
             elide: Text.ElideRight
             textFormat: Text.PlainText
             text: root.busy && root.activityLabel ? root.activityLabel + " …" : root.statusMessage
@@ -2259,7 +2265,7 @@ Item {
             id: hints
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            width: Math.max(0, parent.width - (statusText.text ? statusText.implicitWidth + Style.spacing.xl : 0))
+            width: Math.max(0, footer.free - (statusText.text ? statusText.implicitWidth + Style.spacing.xl : 0))
             height: statusText.implicitHeight
             clip: true
             layoutDirection: Qt.RightToLeft
