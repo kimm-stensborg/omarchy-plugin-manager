@@ -73,7 +73,7 @@ omarchy-shell shell toggle io.github.kimm-stensborg.plugin-manager '{}'
 | `d` / `Del` | remove it (asks first) |
 | `a` / `/` | type a git URL to add, or an export file to import; `⏎` goes, `Esc` leaves the field |
 | `x` | export your plugins to a file |
-| `t` | transfer: export your plugins, or import an export file from `~` or `~/Downloads` |
+| `I` | import: pick an export file and choose which of its plugins to install |
 | `o` | open its repository in the browser |
 | `r` | reload the list |
 | `Esc` | close |
@@ -256,14 +256,14 @@ manager keeps to:
 
 ## Export and import
 
-**Transfer** (`t`) is where plugins move between machines. **Export** there,
-or `x` anywhere, writes every plugin to `~/omarchy-plugins-<host>-<date>.json`.
-Copy that file to the other machine — into its home folder or `~/Downloads` —
-install the Plugin Manager there and open **Transfer**: it lists the export
-files in both folders, newest first, and marks one made on this machine. A
-file kept anywhere else works too: type its path into the add field and press
-`⏎`. Picking a file shows what will be installed and what is skipped, and
-nothing happens until you confirm it.
+**Export**, under the plugin list (or `x`), writes every plugin to
+`~/omarchy-plugins-<host>-<date>.json`. Copy that file to the other machine,
+install the Plugin Manager there and press **Import…** (`I`). The manager
+steps aside for the desktop's file chooser and comes back with the plugins
+in the file you picked: the ones it can install ticked, the rest greyed out
+with the reason (already installed, say). Untick any you do not want and
+press **Import**; nothing is installed before that, and **Cancel** leaves
+everything as it was.
 
 For each plugin the file records:
 
@@ -287,9 +287,8 @@ From a terminal:
 
 ```bash
 bin/plugin-manager export [file]
-bin/plugin-manager exports                   # the export files in ~ and ~/Downloads
-bin/plugin-manager import <file> --dry-run   # what it would do
-bin/plugin-manager import <file>
+bin/plugin-manager import <file> --dry-run      # what it would do
+bin/plugin-manager import <file> [--only a,b]   # all of it, or just these ids
 ```
 
 ## How it works

@@ -85,9 +85,19 @@ cat >"$SANDBOX/bin/omarchy" <<'SHIM'
 printf '%s\n' "$*" >>"$OMARCHY_LOG"
 SHIM
 cp "$SANDBOX/bin/omarchy" "$SANDBOX/bin/omarchy-restart-shell"
+# The desktop file chooser answers $FILE_SELECT_ANSWER, or exits with
+# $FILE_SELECT_EXIT: 1, nothing picked, unless told otherwise.
+cat >"$SANDBOX/bin/omarchy-file-select" <<'SHIM'
+#!/bin/bash
+if [[ -n ${FILE_SELECT_ANSWER:-} ]]; then
+  echo "$FILE_SELECT_ANSWER"
+  exit 0
+fi
+exit "${FILE_SELECT_EXIT:-1}"
+SHIM
 chmod +x "$SANDBOX/bin/omarchy-shell" "$SANDBOX/bin/hyprctl" \
   "$SANDBOX/bin/omarchy-notification-send" "$SANDBOX/bin/omarchy" \
-  "$SANDBOX/bin/omarchy-restart-shell"
+  "$SANDBOX/bin/omarchy-restart-shell" "$SANDBOX/bin/omarchy-file-select"
 export PATH="$SANDBOX/bin:$PATH"
 
 passed=0
@@ -361,6 +371,10 @@ check "a dry run says where an enabled widget goes" \
   '.plan[] | select(.id == "test.epsilon") | .action == "install" and .where == "in the left section"' "$out"
 check "a dry run passes on what the export skipped" '.skippedAtExport[0].id == "test.lib"' "$out"
 holds "a dry run clones nothing" '[[ ! -e $PLUGINS/test.epsilon ]]'
+out=$("$PM" import "$SANDBOX/import.json" --dry-run --only test.zeta)
+check "--only leaves out a plugin it would install but was not picked" \
+  '(.plan[] | select(.id == "test.epsilon") | .action == "skip" and .reason == "not picked")
+   and (.plan[] | select(.id == "test.zeta") | .action == "install") and .message == "1 plugin to import · 4 skipped"' "$out"
 
 : >"$SHELL_LOG"
 out=$("$PM" import "$SANDBOX/import.json")
@@ -383,23 +397,17 @@ check "a file that is not an export is refused" '.ok == false and (.message | te
 out=$("$PM" import "$SANDBOX/nowhere.json")
 check "a missing file is refused" '.ok == false and (.message | test("no file"))' "$out"
 
-# The Import button's search: the default export in the home folder from
-# above, one copied into ~/Downloads a while back, and a namesake that is not
-# an export at all.
-mkdir -p "$HOME/Downloads"
-cp "$SANDBOX/import.json" "$HOME/Downloads/omarchy-plugins-elsewhere-20260901.json"
-touch -d '2 days ago' "$HOME/Downloads/omarchy-plugins-elsewhere-20260901.json"
-echo '{}' >"$HOME/Downloads/omarchy-plugins-junk.json"
-home_export=$(ls "$HOME"/omarchy-plugins-*.json)
-out=$("$PM" exports)
-check "exports finds the exports in home and Downloads, newest first" \
-  ".ok == true and .message == \"2 export files\" and [.files[].path] == [\"$home_export\", \"$HOME/Downloads/omarchy-plugins-elsewhere-20260901.json\"]" "$out"
-check "exports says where each one came from and what it holds" \
-  '.files[1] | .host == "elsewhere" and .exportedAt == "2026-09-01T10:00:00+02:00" and .count == 5' "$out"
-check "exports tells an export made here from one made elsewhere" '.files[0].local == true and .files[1].local == false' "$out"
-rm "$home_export" "$HOME"/Downloads/omarchy-plugins-*.json
-out=$("$PM" exports)
-check "exports with none says where it looked" '.ok == true and .files == [] and .message == "No export files in ~ or ~/Downloads"' "$out"
+# Import…: the desktop chooser picks a file and the manager is summoned back
+# with it; with nothing picked it comes back empty-handed, and a chooser that
+# never opened is reported.
+: >"$SHELL_LOG"
+out=$(FILE_SELECT_ANSWER="$SANDBOX/import.json" "$PM" pick-import)
+check "a picked export goes back to the manager" ".ok == true and .payload.import == \"$SANDBOX/import.json\"" "$out"
+holds "the manager is summoned with the picked file" 'grep -qF "summon $SELF_ID {\"import\":" "$SHELL_LOG"'
+out=$("$PM" pick-import)
+check "with nothing picked the manager comes back with nothing" '.ok == true and .payload == {}' "$out"
+out=$(FILE_SELECT_EXIT=2 "$PM" pick-import)
+check "a chooser that did not open is reported" '.ok == false and .payload.error == true' "$out"
 
 # --------------------------------------------------------------- opening
 # Shortcuts come from ~/.config/hypr/*.lua, checked against the stand-in

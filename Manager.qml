@@ -50,15 +50,15 @@ Item {
   property string busyKind: ""
   property bool busyQuiet: false
 
-  // An import waiting on its confirmation: the dry run's reply.
-  property bool confirmingImport: false
+  // An import being chosen: the dry run's reply for the file picked, and
+  // which of the plugins it would install are ticked (id → true).
   property var importPreview: null
-
-  // The Transfer dialog: export these plugins, or import one of the export
-  // files it found in ~ and ~/Downloads.
-  property bool transferring: false
-  property var exportFiles: []
-  property int exportIndex: 0
+  property var importChosen: ({})
+  property int importCursor: 0
+  readonly property var importPlan: root.importPreview && root.importPreview.plan ? root.importPreview.plan : []
+  readonly property var importPicked: root.importPlan.filter(function(item) {
+    return item.action === "install" && root.importChosen[item.id] === true
+  })
 
   // The SOURCE section of the details: folded to the repository, or all of it.
   property bool sourceOpen: false
@@ -227,7 +227,9 @@ Item {
   // ------------------------------------------------------------- lifecycle
 
   // Payload: {"select": "<id>"} preselects a plugin; {"resume": "<seq>"} is a
-  // detached job coming back to show its result.
+  // detached job coming back to show its result; {"import": "<path>"} is the
+  // file chooser coming back with an export to import, and {"status": "…",
+  // "error": bool} with something to say instead (see pickImport).
   function open(payloadJson) {
     var payload = ({})
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { payload = ({}) }
@@ -237,11 +239,14 @@ Item {
     root.closeDialogs()
     root.now = Date.now()
     if (payload.select) root.selectId = String(payload.select)
+    if (payload.status) root.setStatus(String(payload.status), payload.error === true)
     root.syncJobs(true, payload.resume ? String(payload.resume) : "")
     root.refresh()
-    // A stale check is redone on open; a fresh one comes straight back.
-    if (!root.busy) root.runAction(["check", "--if-stale", String(root.staleSeconds)],
-                                   "Checking for updates", "", "check", true)
+    // A file picked to import is read first. Otherwise a stale check is
+    // redone on open, and a fresh one comes straight back.
+    if (payload.import) root.previewImport(String(payload.import))
+    else if (!root.busy) root.runAction(["check", "--if-stale", String(root.staleSeconds)],
+                                        "Checking for updates", "", "check", true)
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -254,10 +259,9 @@ Item {
 
   function closeDialogs() {
     root.confirmingRemove = false
-    root.confirmingImport = false
     root.confirmingRollback = false
     root.importPreview = null
-    root.transferring = false
+    root.importChosen = ({})
     root.reviewing = false
     root.review = null
     root.inspecting = false
@@ -348,7 +352,7 @@ Item {
 
   // --------------------------------------------------------------- actions
 
-  readonly property var quickKinds: ["check", "export", "exports", "preview", "review", "inspect", "bind", "unbind",
+  readonly property var quickKinds: ["check", "export", "preview", "review", "inspect", "bind", "unbind",
                                      "menu", "menuremove"]
 
   // One action at a time: they all end in the stock commands, which rescan
@@ -396,9 +400,6 @@ Item {
       if (!quiet || summary.error) root.setStatus(summary.text, summary.error)
     } else if (kind === "preview") {
       root.showImportPreview(payload)
-      return
-    } else if (kind === "exports") {
-      root.showTransfer(payload)
       return
     } else if (kind === "review") {
       root.showReview(payload)
@@ -735,51 +736,30 @@ Item {
     root.runAction(["export"], "Exporting plugins", "", "export", false)
   }
 
-  // The Transfer button: find the export files in ~ and ~/Downloads, then
-  // open the dialog that exports or imports. Also callable over IPC:
-  // `omarchy-shell shell call <id> openTransfer x`.
-  function openTransfer() {
-    root.runAction(["exports"], "Looking for export files", "", "exports", false)
+  // Import…: the desktop's file chooser picks an export, and the manager
+  // comes back with it (see `plugin-manager pick-import`). The chooser cannot
+  // be used under the overlay, so the manager steps aside meanwhile.
+  function pickImport() {
+    if (root.busy) {
+      root.setStatus("Still " + root.activityLabel.toLowerCase() + " …", false)
+      return
+    }
+    root.dismiss()
+    Quickshell.execDetached([root.backend, "pick-import"])
   }
 
-  function showTransfer(payload) {
-    root.exportFiles = (payload.files || []).slice(0, 8)
-    root.exportIndex = 0
-    root.transferring = true
-  }
-
-  function closeTransfer() {
-    root.transferring = false
-    keyCatcher.forceActiveFocus()
-  }
-
-  function pickExport(index) {
-    var file = root.exportFiles[index]
-    root.closeTransfer()
-    if (file) root.previewImport(file.path)
-  }
-
-  function exportFromTransfer() {
-    root.closeTransfer()
-    root.exportPlugins()
-  }
-
-  function transferKey(event) {
-    var key = event.key
-    var t = event.text
-    if (key === Qt.Key_Escape) root.closeTransfer()
-    else if (t === "x") root.exportFromTransfer()
-    else if (key === Qt.Key_Up || t === "k") root.exportIndex = Math.max(0, root.exportIndex - 1)
-    else if (key === Qt.Key_Down || t === "j") root.exportIndex = Math.min(root.exportFiles.length - 1, root.exportIndex + 1)
-    else if (key === Qt.Key_Return || key === Qt.Key_Enter) root.pickExport(root.exportIndex)
-  }
-
-  // A dry run came back: show what the import would do and let it be confirmed.
+  // A dry run came back: list what the file holds with the plugins it would
+  // install ticked, to choose which to import.
   function showImportPreview(payload) {
     var plan = payload.plan || []
-    var installs = 0
-    for (var i = 0; i < plan.length; i++) if (plan[i].action === "install") installs++
-    if (installs === 0) {
+    var chosen = ({})
+    var first = -1
+    for (var i = 0; i < plan.length; i++) {
+      if (plan[i].action !== "install") continue
+      chosen[plan[i].id] = true
+      if (first < 0) first = i
+    }
+    if (first < 0) {
       var here = plan.length > 0 && plan.every(function(item) { return item.reason === "already installed" })
       root.setStatus(here
         ? "Nothing to import: " + (plan.length === 1 ? "its one plugin is" : "all " + plan.length + " plugins in it are")
@@ -787,41 +767,54 @@ Item {
         : payload.message + ": everything in the file is already here or was skipped", false)
       return
     }
+    root.importChosen = chosen
+    root.importCursor = first
     root.importPreview = payload
-    confirm.selectedIndex = 0
-    root.confirmingImport = true
   }
 
-  function importMessage() {
-    var p = root.importPreview
-    if (!p) return ""
-    var lines = ["Import from " + (p.host || "another machine")
-                 + (p.exportedAt ? ", exported " + String(p.exportedAt).slice(0, 10) : "") + "?", ""]
-    var plan = p.plan || []
-    for (var i = 0; i < plan.length; i++) {
-      var item = plan[i]
-      if (item.action === "install")
-        lines.push("+ " + item.name + (item.enabled ? "  (enabled" + (item.where ? ", " + item.where : "") + ")" : ""))
+  function toggleImport(index) {
+    var item = root.importPlan[index]
+    if (!item || item.action !== "install") return
+    var chosen = Object.assign({}, root.importChosen)
+    chosen[item.id] = !chosen[item.id]
+    root.importChosen = chosen
+  }
+
+  // The cursor moves between the plugins that can be imported only.
+  function moveImportCursor(delta) {
+    for (var i = root.importCursor + delta; i >= 0 && i < root.importPlan.length; i += delta) {
+      if (root.importPlan[i].action === "install") {
+        root.importCursor = i
+        importList.positionViewAtIndex(i, ListView.Contain)
+        return
+      }
     }
-    var skipped = []
-    for (var j = 0; j < plan.length; j++)
-      if (plan[j].action !== "install") skipped.push("· " + plan[j].name + ": " + plan[j].reason)
-    var atExport = p.skippedAtExport || []
-    for (var k = 0; k < atExport.length; k++)
-      skipped.push("· " + atExport[k].name + ": not in the file, " + atExport[k].reason)
-    if (skipped.length > 0) lines = lines.concat([""], skipped)
-    return lines.join("\n")
   }
 
-  function importConfirmed() {
-    root.confirmingImport = false
-    var p = root.importPreview
+  function cancelImport() {
     root.importPreview = null
-    if (p && p.path) {
-      root.runAction(["import", p.path], "Importing plugins", "", "import", false)
-      urlField.text = ""
-    }
+    root.importChosen = ({})
     keyCatcher.forceActiveFocus()
+  }
+
+  function importChosenPlugins() {
+    var p = root.importPreview
+    var ids = root.importPicked.map(function(item) { return item.id })
+    if (!p || !p.path || ids.length === 0) return
+    root.cancelImport()
+    root.runAction(["import", p.path, "--only", ids.join(",")],
+                   "Importing " + (ids.length === 1 ? "1 plugin" : ids.length + " plugins"), "", "import", false)
+    urlField.text = ""
+  }
+
+  function importKey(event) {
+    var key = event.key
+    var t = event.text
+    if (key === Qt.Key_Escape) root.cancelImport()
+    else if (key === Qt.Key_Return || key === Qt.Key_Enter) root.importChosenPlugins()
+    else if (key === Qt.Key_Space) root.toggleImport(root.importCursor)
+    else if (key === Qt.Key_Up || t === "k") root.moveImportCursor(-1)
+    else if (key === Qt.Key_Down || t === "j") root.moveImportCursor(1)
   }
 
   function openRepo() {
@@ -1252,12 +1245,12 @@ Item {
       event.accepted = true
       return
     }
-    if (root.transferring) {
-      root.transferKey(event)
+    if (root.importPreview) {
+      root.importKey(event)
       event.accepted = true
       return
     }
-    if (root.confirmingRemove || root.confirmingImport || root.confirmingRollback) {
+    if (root.confirmingRemove || root.confirmingRollback) {
       confirm.handleKey(event)
       event.accepted = true
       return
@@ -1281,7 +1274,7 @@ Item {
     else if (t === "d" || key === Qt.Key_Delete) root.askRemove()
     else if (t === "a" || t === "/") urlField.forceActiveFocus()
     else if (t === "x") root.exportPlugins()
-    else if (t === "t") root.openTransfer()
+    else if (t === "I") root.pickImport()
     else if (t === "o") root.openRepo()
     else if (t === "r") root.refresh()
     else return
@@ -1496,7 +1489,7 @@ Item {
             anchors.rightMargin: Style.spacing.controlGap
             anchors.verticalCenter: parent.verticalCenter
             foreground: root.foreground
-            placeholderText: "Git URL of a plugin to add, or an export .json to import  (a)"
+            placeholderText: "Git URL of a plugin to add  (a)"
             onAccepted: root.addPlugin()
             Keys.onEscapePressed: function(event) {
               if (urlField.text) urlField.text = ""
@@ -1507,29 +1500,15 @@ Item {
 
           Button {
             id: addButton
-            anchors.right: transferButton.left
-            anchors.rightMargin: Style.spacing.controlGap
-            anchors.verticalCenter: parent.verticalCenter
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            text: "Add"
-            tooltipText: "Clone the plugin, which stays disabled until you enable it; or preview importing an export file"
-            onClicked: root.addPlugin()
-          }
-
-          Button {
-            id: transferButton
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             bordered: true
             foreground: root.foreground
             fontFamily: root.fontFamily
-            text: "Transfer"
-            tooltipText: "Export your plugins to a file, or import one from another machine  (t)"
-            onClicked: root.openTransfer()
-          }
-        }
+            text: "Add"
+            tooltipText: "Clone the plugin, which stays disabled until you enable it"
+            onClicked: root.addPlugin()
+          }        }
 
         // ------------------------------------------------------------ body
         Item {
@@ -1545,15 +1524,40 @@ Item {
             wrapMode: Text.WordWrap
             visible: root.listedOnce && root.plugins.length === 0
             textFormat: Text.PlainText
-            text: "No plugins installed yet.\nPaste the git URL of a plugin above to add one,\nor Transfer them over from another machine."
+            text: "No plugins installed yet.\nPaste the git URL of a plugin above to add one,\nor Import… the plugins you exported on another machine."
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
           }
 
+          // Moving plugins between machines, under the list: Import… picks an
+          // export file, Export writes one to ~.
+          Row {
+            id: listActions
+            anchors.left: parent.left
+            anchors.bottom: parent.bottom
+            spacing: Style.spacing.controlGap
+
+            Button {
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              text: "Import…"
+              tooltipText: "Pick an export file and choose which of its plugins to install  (I)"
+              onClicked: root.pickImport()
+            }
+
+            Button {
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              text: "Export"
+              tooltipText: "Write your plugins to a file in ~ for another Omarchy install  (x)"
+              onClicked: root.exportPlugins()
+            }
+          }
+
           ListView {
             id: pluginList
-            anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
+            anchors { left: parent.left; top: parent.top; bottom: listActions.top; bottomMargin: root.contentSpacing }
             width: Math.round(parent.width * 0.36)
             clip: true
             spacing: Style.spacing.xxs
@@ -2263,7 +2267,7 @@ Item {
 
             Repeater {
               model: ["esc close", "⏎ open", "i read", "s shortcut", "m menu", "c check", "u update", "b roll back",
-                      "e enable", "d remove", "o repo", "a add", "x export", "t transfer"]
+                      "e enable", "d remove", "o repo", "a add", "x export", "I import"]
 
               Text {
                 required property string modelData
@@ -2278,21 +2282,19 @@ Item {
         }
       }
 
-      // One dialog for the confirmations: removing the selected plugin,
-      // rolling it back, and an import whose dry run is waiting in
-      // importPreview.
+      // One dialog for the confirmations: removing the selected plugin, and
+      // rolling it back.
       ConfirmDialog {
         id: confirm
         anchors.fill: parent
-        opened: root.confirmingRemove || root.confirmingImport || root.confirmingRollback
+        opened: root.confirmingRemove || root.confirmingRollback
         background: root.background
         foreground: root.foreground
         fontFamily: root.fontFamily
         cornerRadius: root.cornerRadius
         cancelText: "Cancel"
-        confirmText: root.confirmingImport ? "Import" : (root.confirmingRollback ? "Roll back" : "Remove")
+        confirmText: root.confirmingRollback ? "Roll back" : "Remove"
         message: {
-          if (root.confirmingImport) return root.importMessage()
           if (root.confirmingRollback) return root.rollbackMessage()
           var p = root.current
           if (!p) return ""
@@ -2300,14 +2302,11 @@ Item {
         }
         onCanceled: {
           root.confirmingRemove = false
-          root.confirmingImport = false
           root.confirmingRollback = false
-          root.importPreview = null
           keyCatcher.forceActiveFocus()
         }
         onConfirmed: {
-          if (root.confirmingImport) root.importConfirmed()
-          else if (root.confirmingRollback) root.rollbackCurrent()
+          if (root.confirmingRollback) root.rollbackCurrent()
           else root.removeCurrent()
         }
       }
@@ -2940,13 +2939,13 @@ Item {
         }
       }
 
-      // ---------------------------------------------------------- transfer
-      // Moving plugins between machines: export these, or import one of the
-      // export files found in ~ and ~/Downloads.
+      // ------------------------------------------------------------ import
+      // The plugins in the export file picked to import: those it can install
+      // ticked, the rest greyed out with the reason, and Import for the ticked.
       Item {
-        id: transferDialog
+        id: importDialog
         anchors.fill: parent
-        visible: root.transferring
+        visible: root.importPreview !== null
 
         Rectangle {
           anchors.fill: parent
@@ -2954,14 +2953,14 @@ Item {
 
           MouseArea {
             anchors.fill: parent
-            onClicked: root.closeTransfer()
+            onClicked: root.cancelImport()
           }
         }
 
         BorderSurface {
-          id: transferCard
+          id: importCard
           width: Math.min(parent.width - Style.space(32), Style.space(560))
-          height: transferCard.contentTopInset + transferCard.contentBottomInset + transferColumn.implicitHeight
+          height: importCard.contentTopInset + importCard.contentBottomInset + importColumn.implicitHeight
           anchors.centerIn: parent
           color: root.background
           borderSpec: Border.flat(root.accent, Style.normalBorderWidth)
@@ -2974,168 +2973,185 @@ Item {
           }
 
           Column {
-            id: transferColumn
+            id: importColumn
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.top: parent.top
-            anchors.topMargin: transferCard.contentTopInset
-            anchors.leftMargin: transferCard.contentLeftInset
-            anchors.rightMargin: transferCard.contentRightInset
+            anchors.topMargin: importCard.contentTopInset
+            anchors.leftMargin: importCard.contentLeftInset
+            anchors.rightMargin: importCard.contentRightInset
             spacing: Style.spacing.lg
 
             Text {
               width: parent.width
               elide: Text.ElideRight
               textFormat: Text.PlainText
-              text: "Transfer plugins"
+              text: "Import plugins"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
               font.bold: true
             }
 
+            // Where the file came from, and the file itself on one line,
+            // however deep it sits.
             Column {
-              width: parent.width
-              spacing: Style.spacing.sm
-
-              PanelSectionHeader {
-                text: "EXPORT"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              Item {
-                width: parent.width
-                height: Math.max(exportNote.implicitHeight, exportNowButton.implicitHeight)
-
-                Text {
-                  id: exportNote
-                  anchors.left: parent.left
-                  anchors.right: exportNowButton.left
-                  anchors.rightMargin: Style.spacing.lg
-                  anchors.verticalCenter: parent.verticalCenter
-                  wrapMode: Text.WordWrap
-                  textFormat: Text.PlainText
-                  text: "Write your plugins to a file in ~, with their places in the bar and their settings, to copy to the other machine."
-                  color: root.muted
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                Button {
-                  id: exportNowButton
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  bordered: true
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  text: "Export"
-                  tooltipText: "Write the export file now  (x)"
-                  onClicked: root.exportFromTransfer()
-                }
-              }
-            }
-
-            Column {
-              id: exportsList
               width: parent.width
               spacing: Style.spacing.xxs
 
-              PanelSectionHeader {
-                text: "IMPORT"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
               Text {
                 width: parent.width
-                bottomPadding: Style.spacing.xs
-                wrapMode: Text.WordWrap
+                elide: Text.ElideRight
                 textFormat: Text.PlainText
-                text: root.exportFiles.length === 0
-                  ? "No export files in ~ or ~/Downloads. Copy one there, or type its path in the field."
-                  : "Export files in ~ and ~/Downloads, newest first. Pick one to preview it."
+                text: {
+                  var p = root.importPreview
+                  if (!p) return ""
+                  return "From " + (p.host || "another machine") + (p.exportedAt ? ", exported " + root.ago(p.exportedAt) : "")
+                }
                 color: root.muted
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
 
-              Repeater {
-                model: root.exportFiles
+              Text {
+                width: parent.width
+                elide: Text.ElideMiddle
+                textFormat: Text.PlainText
+                text: root.importPreview ? root.homePath(root.importPreview.path) : ""
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
 
+            // Scrolls once there are more than fit.
+            ListView {
+              id: importList
+              width: parent.width
+              height: Math.min(contentHeight, Style.space(300))
+              clip: true
+              interactive: contentHeight > height
+              boundsBehavior: Flickable.StopAtBounds
+              spacing: Style.spacing.xxs
+              model: root.importPlan
+
+              delegate: Rectangle {
+                id: importRow
+                required property var modelData
+                required property int index
+                readonly property bool installable: importRow.modelData.action === "install"
+                readonly property bool ticked: importRow.installable && root.importChosen[importRow.modelData.id] === true
+                readonly property bool cursor: importRow.installable && importRow.index === root.importCursor
+
+                width: importList.width
+                height: root.rowHeight
+                radius: root.cornerRadius
+                color: importRow.cursor ? root.selectedBackground : "transparent"
+
+                // The tick box: filled when the plugin will be imported.
                 Rectangle {
-                  id: exportRow
-                  required property var modelData
-                  required property int index
-                  readonly property bool selected: exportRow.index === root.exportIndex
+                  id: tickBox
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.spacing.rowPaddingX
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Math.round(Style.font.body * 1.25)
+                  height: width
+                  radius: Style.spacing.xs
+                  opacity: importRow.installable ? 1 : 0.35
+                  color: importRow.ticked ? root.accent : "transparent"
+                  border.width: 1
+                  border.color: importRow.ticked ? root.accent : root.muted
 
-                  width: exportsList.width
-                  height: root.rowHeight
-                  radius: root.cornerRadius
-                  color: exportRow.selected ? root.selectedBackground : "transparent"
+                  Text {
+                    anchors.centerIn: parent
+                    visible: importRow.ticked
+                    textFormat: Text.PlainText
+                    text: "✓"
+                    color: root.background
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+                }
 
-                  Column {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.leftMargin: Style.spacing.rowPaddingX
-                    anchors.rightMargin: Style.spacing.rowPaddingX
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: Style.spacing.xxs
+                Column {
+                  anchors.left: tickBox.right
+                  anchors.leftMargin: Style.spacing.xl
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.spacing.rowPaddingX
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.spacing.xxs
 
-                    Text {
-                      width: parent.width
-                      elide: Text.ElideRight
-                      textFormat: Text.PlainText
-                      text: (exportRow.modelData.host || "Another machine")
-                        + (exportRow.modelData.local ? " (this machine)" : "") + "  ·  " + exportRow.modelData.count
-                        + (exportRow.modelData.count === 1 ? " plugin" : " plugins")
-                      color: exportRow.selected ? root.selectedText : root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.body
-                    }
-
-                    Text {
-                      width: parent.width
-                      elide: Text.ElideMiddle
-                      textFormat: Text.PlainText
-                      text: (exportRow.modelData.exportedAt ? "exported " + root.ago(exportRow.modelData.exportedAt) + "  ·  " : "")
-                        + root.homePath(exportRow.modelData.path)
-                      color: root.muted
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                    }
+                  Text {
+                    width: parent.width
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    text: importRow.modelData.name
+                    color: !importRow.installable ? root.muted : (importRow.cursor ? root.selectedText : root.foreground)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
                   }
 
-                  MouseArea {
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onEntered: root.exportIndex = exportRow.index
-                    onClicked: root.pickExport(exportRow.index)
+                  Text {
+                    width: parent.width
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    text: !importRow.installable ? importRow.modelData.reason
+                      : importRow.modelData.enabled
+                        ? "switched on" + (importRow.modelData.where ? " " + importRow.modelData.where : "")
+                        : "added switched off"
+                    color: root.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
                   }
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  enabled: importRow.installable
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onEntered: root.importCursor = importRow.index
+                  onClicked: root.toggleImport(importRow.index)
                 }
               }
             }
 
+            // What the export itself left out, and why.
+            Text {
+              width: parent.width
+              visible: text !== ""
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: {
+                var left = root.importPreview && root.importPreview.skippedAtExport ? root.importPreview.skippedAtExport : []
+                return left.length === 0 ? ""
+                  : "Not in the file: " + left.map(function(s) { return s.name + " (" + s.reason + ")" }).join(", ")
+              }
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
             Item {
               width: parent.width
-              height: exportsButtons.implicitHeight
+              height: importButtons.implicitHeight
 
               Text {
                 anchors.left: parent.left
-                anchors.right: exportsButtons.left
+                anchors.right: importButtons.left
                 anchors.rightMargin: Style.spacing.xl
                 anchors.verticalCenter: parent.verticalCenter
                 elide: Text.ElideRight
                 textFormat: Text.PlainText
-                text: root.exportFiles.length > 0 ? "↑↓ choose   ⏎ preview   x export   esc close" : "x export   esc close"
+                text: "↑↓ choose   space tick   ⏎ import   esc cancel"
                 color: root.muted
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
 
               Row {
-                id: exportsButtons
+                id: importButtons
                 anchors.right: parent.right
                 spacing: Style.spacing.controlGap
 
@@ -3143,17 +3159,16 @@ Item {
                   bordered: true
                   foreground: root.foreground
                   fontFamily: root.fontFamily
-                  text: "Close"
-                  onClicked: root.closeTransfer()
+                  text: "Cancel"
+                  onClicked: root.cancelImport()
                 }
 
                 Button {
-                  visible: root.exportFiles.length > 0
                   bordered: true
-                  foreground: root.accent
+                  foreground: root.importPicked.length > 0 ? root.accent : root.muted
                   fontFamily: root.fontFamily
-                  text: "Preview"
-                  onClicked: root.pickExport(root.exportIndex)
+                  text: "Import (" + root.importPicked.length + ")"
+                  onClicked: root.importChosenPlugins()
                 }
               }
             }

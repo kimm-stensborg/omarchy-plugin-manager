@@ -23,8 +23,8 @@
 #   plugin-manager menu-add <id> [--parent P] [--label L] [--description D] [--icon G]
 #   plugin-manager menu-remove <id>
 #   plugin-manager export [file]
-#   plugin-manager exports
-#   plugin-manager import <file> [--dry-run]
+#   plugin-manager import <file> [--dry-run] [--only id,id…]
+#   plugin-manager pick-import
 #   plugin-manager run --label L --id ID --kind K -- <command...>
 #
 # Only git plugins are managed: the checkouts `omarchy plugin add` makes in
@@ -1293,35 +1293,29 @@ cmd_export() {
   reply true "$message" "" "$(jq -c --arg path "$file" '{path: $path, exported: (.plugins | length), skipped: .skipped}' <<<"$out")"
 }
 
-# The export files there are to import: omarchy-plugins-*.json in the home
-# folder, where export writes them, and in the download folder, where a copied
-# one tends to land. Only real exports, newest first, each with the machine it
-# came from (local: this one), when it was made and how many plugins it holds.
-cmd_exports() {
-  local downloads dir file entry entries=() dirs=("$HOME")
-  downloads=$(xdg-user-dir DOWNLOAD 2>/dev/null)
-  # Without a user-dirs.dirs, xdg-user-dir answers the home folder itself.
-  [[ -n $downloads && $downloads != "$HOME" ]] || downloads="$HOME/Downloads"
-  dirs+=("$downloads")
-
-  for dir in "${dirs[@]}"; do
-    for file in "$dir"/omarchy-plugins-*.json; do
-      [[ -f $file ]] || continue
-      entry=$(jq -c --arg format "$EXPORT_FORMAT" --arg path "$file" --arg here "$(uname -n)" \
-        --argjson modified "$(stat -c %Y "$file")" '
-        select(type == "object" and .format == $format and .version == 1)
-        | {path: $path, host: (.host // ""), local: (.host == $here), exportedAt: (.exportedAt // ""),
-           count: ((.plugins // []) | length), modified: $modified}' "$file" 2>/dev/null)
-      [[ -n $entry ]] && entries+=("$entry")
-    done
-  done
-
-  local files count
-  files=$( ((${#entries[@]} > 0)) && printf '%s\n' "${entries[@]}" | jq -sc 'sort_by(-.modified)' || echo '[]')
-  count=$(jq length <<<"$files")
-  local message="No export files in ~ or ${downloads/#$HOME/\~}"
-  ((count == 0)) || message="$count export file$( ((count == 1)) || echo s)"
-  reply true "$message" "" "$(jq -c '{files: .}' <<<"$files")"
+# The Import… button: the desktop's file chooser picks an export, and the
+# manager is summoned back with it -- {"import": path}, or {} when nothing was
+# picked -- to show what is in it. The overlay hides and starts this detached,
+# since under the overlay the chooser could not be used.
+cmd_pick_import() {
+  local file rc payload message ok=true
+  file=$(omarchy-file-select --title "Import plugins" --extensions json 2>/dev/null)
+  rc=$?
+  file=$(head -n 1 <<<"$file")
+  if ((rc == 0)) && [[ -n $file ]]; then
+    payload=$(jq -cn --arg path "$file" '{import: $path}')
+    message="Picked ${file/#$HOME/\~}"
+  elif ((rc == 1)); then
+    payload='{}'
+    message="Nothing picked"
+  else
+    ok=false
+    message="The file chooser did not open"
+    payload=$(jq -cn --arg message "$message" '{status: $message, error: true}')
+  fi
+  omarchy-shell shell summon "$SELF_ID" "$payload" >/dev/null 2>&1 || true
+  reply "$ok" "$message" "" "$(jq -cn --argjson payload "$payload" '{payload: $payload}')"
+  [[ $ok == true ]]
 }
 
 # Every folder in the plugin directory, git or not and the manager included:
@@ -1415,10 +1409,11 @@ restore_enabled() {
 }
 
 cmd_import() {
-  local file="" dry=0 doc plan
+  local file="" dry=0 only="" doc plan
   while (($# > 0)); do
     case "$1" in
     --dry-run) dry=1; shift ;;
+    --only) only="${2:-}"; shift 2 ;;
     -*) fail "unknown import option: $1" ;;
     *)
       [[ -z $file ]] || fail "unexpected argument: $1"
@@ -1435,7 +1430,8 @@ cmd_import() {
 
   # What happens to each plugin. The file is data from elsewhere, so ids are
   # checked here and URLs by omarchy-plugin-add before anything is cloned.
-  plan=$(jq -c --argjson installed "$(installed_json)" '
+  # With --only, a plugin it would install that is not named is left out.
+  plan=$(jq -c --argjson installed "$(installed_json)" --arg only "$only" '
     [ (.plugins // [])[]
       | select(type == "object")
       | (.id // "" | tostring) as $id
@@ -1448,7 +1444,9 @@ cmd_import() {
           . + {action: "skip", reason: "an invalid plugin id"}
         elif ($installed | index($id)) != null then . + {action: "skip", reason: "already installed"}
         elif .url == "" then . + {action: "skip", reason: "no URL to fetch it from"}
-        else . + {action: "install"} end ]' <<<"$doc")
+        else . + {action: "install"} end
+      | if $only != "" and .action == "install" and (($only | split(",") | index($id)) == null)
+        then . + {action: "skip", reason: "not picked"} else . end ]' <<<"$doc")
 
   local installing
   installing=$(jq '[.[] | select(.action == "install")] | length' <<<"$plan")
@@ -1628,7 +1626,7 @@ unbind) cmd_unbind "$@" ;;
 menu-add) cmd_menu_add "$@" ;;
 menu-remove) cmd_menu_remove "$@" ;;
 export) cmd_export "$@" ;;
-exports) cmd_exports ;;
+pick-import) cmd_pick_import ;;
 import) cmd_import "$@" ;;
 run) cmd_run "$@" ;;
 -h | --help | help)
