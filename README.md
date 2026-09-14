@@ -263,7 +263,8 @@ steps aside for the desktop's file chooser and comes back with the plugins
 in the file you picked: the ones it can install ticked, the rest greyed out
 with the reason (already installed, say). Untick any you do not want and
 press **Import**; nothing is installed before that, and **Cancel** leaves
-everything as it was.
+everything as it was. When everything in the file is already installed it
+says so, each plugin marked as such, and **Close** is all there is to do.
 
 For each plugin the file records:
 

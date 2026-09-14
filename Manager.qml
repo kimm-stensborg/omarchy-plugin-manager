@@ -59,6 +59,12 @@ Item {
   readonly property var importPicked: root.importPlan.filter(function(item) {
     return item.action === "install" && root.importChosen[item.id] === true
   })
+  readonly property int importInstallable: root.importPlan.filter(function(item) {
+    return item.action === "install"
+  }).length
+  readonly property bool importAllHere: root.importPlan.length > 0 && root.importPlan.every(function(item) {
+    return item.reason === "already installed"
+  })
 
   // The SOURCE section of the details: folded to the repository, or all of it.
   property bool sourceOpen: false
@@ -748,8 +754,9 @@ Item {
     Quickshell.execDetached([root.backend, "pick-import"])
   }
 
-  // A dry run came back: list what the file holds with the plugins it would
-  // install ticked, to choose which to import.
+  // A dry run came back: list everything the file holds, the plugins it
+  // would install ticked to choose from. With none, the list still shows why
+  // -- already installed, most often -- and the dialog only closes.
   function showImportPreview(payload) {
     var plan = payload.plan || []
     var chosen = ({})
@@ -758,14 +765,6 @@ Item {
       if (plan[i].action !== "install") continue
       chosen[plan[i].id] = true
       if (first < 0) first = i
-    }
-    if (first < 0) {
-      var here = plan.length > 0 && plan.every(function(item) { return item.reason === "already installed" })
-      root.setStatus(here
-        ? "Nothing to import: " + (plan.length === 1 ? "its one plugin is" : "all " + plan.length + " plugins in it are")
-          + " already installed"
-        : payload.message + ": everything in the file is already here or was skipped", false)
-      return
     }
     root.importChosen = chosen
     root.importCursor = first
@@ -811,7 +810,10 @@ Item {
     var key = event.key
     var t = event.text
     if (key === Qt.Key_Escape) root.cancelImport()
-    else if (key === Qt.Key_Return || key === Qt.Key_Enter) root.importChosenPlugins()
+    else if (key === Qt.Key_Return || key === Qt.Key_Enter) {
+      if (root.importInstallable > 0) root.importChosenPlugins()
+      else root.cancelImport()
+    }
     else if (key === Qt.Key_Space) root.toggleImport(root.importCursor)
     else if (key === Qt.Key_Up || t === "k") root.moveImportCursor(-1)
     else if (key === Qt.Key_Down || t === "j") root.moveImportCursor(1)
@@ -3030,6 +3032,20 @@ Item {
               }
             }
 
+            // With nothing in the file to install, say so; Close is all that
+            // is left to do.
+            Text {
+              width: parent.width
+              visible: root.importInstallable === 0
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: root.importAllHere ? "Everything in this file is already installed."
+                                       : "Nothing in this file can be installed here."
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+            }
+
             // Scrolls once there are more than fit.
             ListView {
               id: importList
@@ -3048,13 +3064,15 @@ Item {
                 readonly property bool installable: importRow.modelData.action === "install"
                 readonly property bool ticked: importRow.installable && root.importChosen[importRow.modelData.id] === true
                 readonly property bool cursor: importRow.installable && importRow.index === root.importCursor
+                readonly property bool installed: importRow.modelData.reason === "already installed"
 
                 width: importList.width
                 height: root.rowHeight
                 radius: root.cornerRadius
                 color: importRow.cursor ? root.selectedBackground : "transparent"
 
-                // The tick box: filled when the plugin will be imported.
+                // The tick box: filled when the plugin will be imported, and
+                // a greyed-out tick when it is already installed.
                 Rectangle {
                   id: tickBox
                   anchors.left: parent.left
@@ -3063,17 +3081,17 @@ Item {
                   width: Math.round(Style.font.body * 1.25)
                   height: width
                   radius: Style.spacing.xs
-                  opacity: importRow.installable ? 1 : 0.35
-                  color: importRow.ticked ? root.accent : "transparent"
+                  opacity: importRow.installable ? 1 : (importRow.installed ? 0.6 : 0.35)
+                  color: importRow.ticked ? root.accent : (importRow.installed ? Util.alpha(root.foreground, 0.15) : "transparent")
                   border.width: 1
                   border.color: importRow.ticked ? root.accent : root.muted
 
                   Text {
                     anchors.centerIn: parent
-                    visible: importRow.ticked
+                    visible: importRow.ticked || importRow.installed
                     textFormat: Text.PlainText
                     text: "✓"
-                    color: root.background
+                    color: importRow.ticked ? root.background : root.muted
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     font.bold: true
@@ -3150,7 +3168,7 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 elide: Text.ElideRight
                 textFormat: Text.PlainText
-                text: "↑↓ choose   space tick   ⏎ import   esc cancel"
+                text: root.importInstallable > 0 ? "↑↓ choose   space tick   ⏎ import   esc cancel" : "⏎ or esc close"
                 color: root.muted
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -3165,11 +3183,12 @@ Item {
                   bordered: true
                   foreground: root.foreground
                   fontFamily: root.fontFamily
-                  text: "Cancel"
+                  text: root.importInstallable > 0 ? "Cancel" : "Close"
                   onClicked: root.cancelImport()
                 }
 
                 Button {
+                  visible: root.importInstallable > 0
                   bordered: true
                   foreground: root.importPicked.length > 0 ? root.accent : root.muted
                   fontFamily: root.fontFamily
