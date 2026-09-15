@@ -138,6 +138,10 @@ brings in: the commits, the files it changes with their added and removed
 lines, and the diff itself (up to 3000 lines). Nothing changes until you
 confirm with `⏎` or **Update**; `Esc` leaves the plugin as it is.
 
+Adding a plugin restarts the shell too, on the same grounds: it puts code at
+an id the shell may already have compiled, so re-adding something removed
+earlier would otherwise switch on the old copy.
+
 An update that actually moved the plugin restarts the shell afterwards, and
 summons the manager back to show the result. A rescan re-reads manifests but
 not the QML behind them, so a running shell keeps the code it loaded until it

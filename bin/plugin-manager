@@ -775,8 +775,12 @@ cmd_add() {
   # model is to read the code before switching it on.
   if out=$(omarchy-plugin-add "$url" --yes 2>&1 </dev/null); then
     id=$(sed -n 's/^Added \(.*\) into .*/\1/p' <<<"$out" | tail -n 1)
+    # Restarts for the same reason an update does: this puts code on disk at an
+    # id the shell may already have compiled, and a re-add of a plugin removed
+    # earlier in the session would otherwise enable the old copy. Harmless when
+    # the id is genuinely new, and adding is rare.
     reply true "Added ${id:-the plugin}. It stays disabled until you enable it." "$out" \
-      "$(jq -cn --arg id "$id" '{id: $id}')"
+      "$(jq -cn --arg id "$id" '{id: $id, restart: true}')"
   else
     reply false "$(last_line "$out")" "$out"
     return 1

@@ -275,6 +275,9 @@ commit_all "$SANDBOX/delta-work" "Initial"
 git -C "$SANDBOX/delta-work" push -q "$SANDBOX/delta.git" main
 out=$("$PM" add "$SANDBOX/delta.git")
 check "add clones the plugin and reports its id" '.ok == true and .id == "test.delta"' "$out"
+# Adding puts code at an id the shell may already have compiled, so a re-add of
+# something removed earlier would otherwise enable the old copy.
+check "add asks for a restart" '.restart == true' "$out"
 holds "the added plugin is on disk" '[[ -f $PLUGINS/test.delta/manifest.json ]]'
 check "the added plugin is a git plugin in the list" '[.plugins[].id] | index("test.delta") != null' "$("$PM" list)"
 out=$("$PM" add "$SANDBOX/delta.git")
