@@ -28,8 +28,11 @@
 #   plugin-manager run --label L --id ID --kind K -- <command...>
 #
 # Only git plugins are managed: the checkouts `omarchy plugin add` makes in
-# ~/.config/omarchy/plugins. Clones of built-ins, folders dropped in by hand
-# and symlinks are left alone, as are the built-in omarchy.* plugins. The
+# ~/.config/omarchy/plugins. Clones of built-ins and folders dropped in by hand
+# are left alone, as are the built-in omarchy.* plugins. A symlink -- a working
+# copy that lives in a project folder -- is listed, so it is not simply missing
+# from a list of what is installed, but everything that would write into the
+# checkout behind it is refused: no check, update, rollback or remove. The
 # manager lists itself too, so it can be checked and updated, but it will not
 # remove itself or switch itself off.
 
@@ -107,13 +110,40 @@ is_git_plugin() {
   [[ -d $PLUGINS_DIR/$1/.git && ! -L $PLUGINS_DIR/$1 ]]
 }
 
-# A plugin the manager may act on: any git plugin, the manager included.
-require_managed() {
+# A symlink to a plugin kept somewhere else -- a checkout linked in while it is
+# worked on. It is shown, so the list is the whole of what is installed, but it
+# is never acted on.
+is_linked_plugin() {
+  [[ -L $PLUGINS_DIR/$1 && -f $PLUGINS_DIR/$1/manifest.json ]]
+}
+
+# Where a linked plugin actually lives, written as ~/... .
+link_target() {
+  local target
+  target=$(readlink -f "$PLUGINS_DIR/$1" 2>/dev/null) || target=""
+  printf '%s\n' "${target/#$HOME/\~}"
+}
+
+# A plugin the manager may show: a git plugin or a linked working copy. Enough
+# for the things that only touch your own config -- enabling, a shortcut, a
+# menu entry -- and for reading what a plugin ships.
+require_listed() {
   local id="$1"
   [[ -n $id ]] || fail "a plugin id is required"
   valid_id "$id" || fail "invalid plugin id '$id'"
   [[ -e $PLUGINS_DIR/$id || -L $PLUGINS_DIR/$id ]] || fail "plugin '$id' is not installed"
-  is_git_plugin "$id" || fail "'$id' is not a git plugin, and git plugins are all the manager handles"
+  is_git_plugin "$id" || is_linked_plugin "$id" ||
+    fail "'$id' is not a git plugin, and git plugins are all the manager handles"
+}
+
+# A plugin the manager may act on: any git plugin, the manager included. A
+# linked plugin is not one -- a fetch, a reset or a remove there would reach
+# into a folder someone is working in.
+require_managed() {
+  local id="$1"
+  require_listed "$id"
+  ! is_linked_plugin "$id" ||
+    fail "'$id' is linked to $(link_target "$id"), and the manager leaves a working copy alone"
 }
 
 # refuse_self <id> <verb> -- the things the manager will not do to itself.
@@ -135,6 +165,16 @@ managed_ids() {
   while IFS= read -r id; do
     is_git_plugin "$id" && printf '%s\n' "$id"
   done < <(find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' | sort)
+  return 0
+}
+
+# What the list shows: the managed plugins and the linked ones with them.
+listed_ids() {
+  [[ -d $PLUGINS_DIR ]] || return 0
+  local id
+  while IFS= read -r id; do
+    if is_git_plugin "$id" || is_linked_plugin "$id"; then printf '%s\n' "$id"; fi
+  done < <(find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) ! -name '.*' -printf '%f\n' | sort)
   return 0
 }
 
@@ -189,9 +229,16 @@ plugin_json() {
   local id="$1"
   local dir="$PLUGINS_DIR/$1"
   local manifest="$dir/manifest.json"
-  local validation valid=true m='{}' bins
+  local validation valid=true m='{}' bins linked=false target=""
 
-  validation=$(omarchy-plugin-validate "$dir" 2>&1) || valid=false
+  if is_linked_plugin "$id"; then
+    linked=true
+    target=$(readlink -f "$dir" 2>/dev/null) || target=""
+  fi
+
+  # A linked plugin is validated where it lives: the validator refuses a plugin
+  # folder that is a symlink, which says nothing about the plugin itself.
+  validation=$(omarchy-plugin-validate "${target:-$dir}" 2>&1) || valid=false
   if [[ -f $manifest ]]; then
     m=$(jq -c 'if type == "object" then . else {} end' "$manifest" 2>/dev/null) || m='{}'
     [[ -n $m ]] || m='{}'
@@ -201,6 +248,7 @@ plugin_json() {
   bins=$(find "$dir/bin" -maxdepth 1 -type f -perm -u+x -printf '%f\n' 2>/dev/null | jq -R . | jq -cs .)
 
   jq -cn --arg id "$id" --arg dir "$dir" --arg self "$SELF_ID" \
+    --argjson linked "$linked" --arg linkTarget "$target" \
     --argjson valid "$valid" --arg validation "${validation#omarchy-plugin-validate: }" \
     --argjson m "$m" --argjson git "$(git_info "$dir")" --argjson bins "${bins:-[]}" '
     def str(v): if (v | type) == "string" then v else "" end;
@@ -214,6 +262,9 @@ plugin_json() {
       description: str($m.description),
       kinds: (if ($m.kinds | type) == "array" then $m.kinds else [] end),
       path: $dir,
+      # A working copy linked in from elsewhere: shown, never acted on.
+      linked: $linked,
+      linkTarget: $linkTarget,
       bins: $bins,
       valid: $valid,
       validationError: (if $valid then "" else $validation end),
@@ -361,7 +412,7 @@ cmd_list() {
 
   while IFS= read -r id; do
     [[ -n $id ]] && items+=("$(plugin_json "$id")")
-  done < <(managed_ids)
+  done < <(listed_ids)
 
   printf '%s\n' "${items[@]}" | jq -cs --argjson shell "$shell_plugins" --argjson cache "$cache" \
     --argjson binds "$(config_binds_json)" --argjson markers "$(bind_markers_json)" \
@@ -646,7 +697,7 @@ cmd_review() {
 # its README.
 cmd_inspect() {
   local id="${1:-}" dir name files readme_file="" tmp meta path mode size
-  require_managed "$id"
+  require_listed "$id"
   dir="$PLUGINS_DIR/$id"
   name=$(plugin_name "$id")
 
@@ -789,14 +840,14 @@ cmd_add() {
 
 cmd_enable() {
   local id="${1:-}"
-  require_managed "$id"
+  require_listed "$id"
   refuse_self "$id" "switch on"
   run_stock "" "$id" omarchy-plugin-enable "$id"
 }
 
 cmd_disable() {
   local id="${1:-}"
-  require_managed "$id"
+  require_listed "$id"
   refuse_self "$id" "switch off"
   run_stock "" "$id" omarchy-plugin-disable "$id"
 }
@@ -1273,7 +1324,8 @@ cmd_export() {
         | select(.self | not)
         | . as $p
         | ($p.git.remote // "") as $remote
-        | if $remote == "" then skip($p; "it has no remote to fetch it from")
+        | if $p.linked then skip($p; "it is linked to a working copy on this machine")
+          elif $remote == "" then skip($p; "it has no remote to fetch it from")
           elif ($remote | portable | not) then skip($p; "its remote is a path on this machine")
           else
             { plugin: {

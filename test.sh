@@ -167,8 +167,8 @@ git -C "$PLUGINS/test.broken" rm -q Overlay.qml
 commit_all "$PLUGINS/test.broken" "Lose the entry point"
 
 # Plugins that are not git plugins, which the manager leaves alone: test.beta
-# dropped in by hand, test.gamma a clone of a built-in, and test.link a symlink
-# to a git working copy elsewhere.
+# dropped in by hand and test.gamma a clone of a built-in. test.link is a
+# symlink to a git working copy elsewhere: listed, but never acted on.
 write_plugin "$PLUGINS/test.beta" test.beta 0.1.0
 write_plugin "$PLUGINS/test.gamma" test.gamma 1.0.0 '{"omarchy": {"clonedFrom": "omarchy.clock"}}'
 git_plugin "$SANDBOX/link-work" test.link
@@ -182,8 +182,13 @@ write_plugin "$PLUGINS/.test.old.bak.20260101000000" test.old 1.0.0
 # ------------------------------------------------------------------ list
 out=$("$PM" list)
 check "list succeeds" '.ok == true' "$out"
-check "list shows the git plugins, sorted, the manager among them" \
-  "[.plugins[].id] == [\"$SELF_ID\", \"test.alpha\", \"test.broken\"]" "$out"
+check "list shows the git plugins and the linked ones, sorted, the manager among them" \
+  "[.plugins[].id] == [\"$SELF_ID\", \"test.alpha\", \"test.broken\", \"test.link\"]" "$out"
+check "a linked plugin is marked, with where it lives, and nothing else is" \
+  'all(.plugins[]; .linked == (.id == "test.link"))
+   and (.plugins[] | select(.id == "test.link") | .linkTarget | endswith("/link-work"))' "$out"
+check "a plugin dropped in by hand or cloned from a built-in is still left out" \
+  'all(.plugins[]; .id != "test.beta" and .id != "test.gamma")' "$out"
 check "the manager is marked as itself, and nothing else is" \
   "all(.plugins[]; .self == (.id == \"$SELF_ID\"))" "$out"
 check "a git plugin carries its remote, branch and last commit" \
@@ -293,10 +298,29 @@ out=$("$PM" remove test.beta)
 check "removing a plugin that is not git is refused" '.ok == false and (.message | test("not a git plugin"))' "$out"
 holds "it is still on disk" '[[ -d $PLUGINS/test.beta ]]'
 out=$("$PM" remove test.link)
-check "a symlink to a git working copy is not a git plugin" '.ok == false and (.message | test("not a git plugin"))' "$out"
+check "a linked plugin is not removed, and the message says where it lives" \
+  '.ok == false and (.message | test("is linked to") and test("link-work"))' "$out"
 holds "the symlink is still there" '[[ -L $PLUGINS/test.link ]]'
 out=$("$PM" remove "$SELF_ID")
 check "removing the manager itself is refused" '.ok == false and (.message | test("itself"))' "$out"
+
+# ----------------------------------------------------------------- linked
+# A linked plugin is listed and can be read and switched on -- that is only
+# your own config -- but nothing that would write into the checkout it points
+# at is offered.
+for command in check review update rollback; do
+  out=$("$PM" "$command" test.link)
+  check "a linked plugin is not ${command}ed" '.ok == false and (.message | test("is linked to"))' "$out"
+done
+out=$("$PM" inspect test.link)
+check "a linked plugin can still be read" '.ok == true and (.files | length) > 0' "$out"
+: >"$SHELL_LOG"
+out=$("$PM" enable test.link)
+check "a linked plugin can still be switched on" '.ok == true' "$out"
+holds "enabling it asks the shell, like any other" 'grep -qxF "enablePlugin test.link {}" "$SHELL_LOG"'
+out=$("$PM" disable test.link)
+check "and off again" '.ok == true' "$out"
+holds "the working copy is untouched throughout" '[[ -L $PLUGINS/test.link && -d $SANDBOX/link-work/.git ]]'
 holds "the manager is still there" '[[ -d $PLUGINS/$SELF_ID ]]'
 out=$("$PM" remove ../../etc)
 check "a path is not an id" '.ok == false and (.message | test("invalid"))' "$out"
@@ -329,7 +353,9 @@ check "an exported bar widget carries its place, neighbours and settings" \
 check "a git plugin without a remote is skipped with the reason" \
   '.skipped[] | select(.id == "test.broken") | .reason | test("no remote")' "$doc"
 check "plugins that are not git are left out of the export altogether" \
-  'all((.plugins + .skipped)[]; .id != "test.beta" and .id != "test.gamma" and .id != "test.link")' "$doc"
+  'all((.plugins + .skipped)[]; .id != "test.beta" and .id != "test.gamma")' "$doc"
+check "a linked plugin is skipped with the reason" \
+  '.skipped[] | select(.id == "test.link") | .reason | test("linked to a working copy")' "$doc"
 check "the manager itself is neither exported nor skipped" \
   "all((.plugins + .skipped)[]; .id != \"$SELF_ID\")" "$doc"
 

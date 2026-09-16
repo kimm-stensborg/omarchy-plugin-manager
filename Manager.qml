@@ -7,7 +7,8 @@ import qs.Commons
 import qs.Ui
 
 // Plugin Manager. Lists the git plugins in ~/.config/omarchy/plugins -- never
-// the built-in omarchy.* ones -- with their details, how each one opens,
+// the built-in omarchy.* ones -- and, greyed out beside them, the ones linked
+// in from a working copy elsewhere, with their details, how each one opens,
 // whether an update is waiting, and the actions to open, read, review and
 // update, roll back, enable, disable, give a shortcut or a menu entry to,
 // remove or add one. It lists itself too, so it can update itself, but it will
@@ -127,6 +128,9 @@ Item {
   readonly property var current: root.selectedIndex >= 0 && root.selectedIndex < root.plugins.length
     ? root.plugins[root.selectedIndex] : null
   readonly property bool currentIsSelf: root.current !== null && root.current.self === true
+  // A linked plugin lives in a folder someone is working in: it is shown and
+  // can be switched on, read and opened, but nothing here writes to its checkout.
+  readonly property bool currentIsLinked: root.current !== null && root.current.linked === true
   readonly property var primary: root.primaryAction(root.current)
   readonly property string primaryKind: root.primary ? root.primary.kind : ""
   readonly property int updateCount: {
@@ -501,7 +505,17 @@ Item {
 
   function checkCurrent() {
     var p = root.current
-    if (p) root.runAction(["check", p.id], "Checking " + p.name, p.id, "check", false)
+    if (!p) return
+    if (root.refuseLinked(p, "checked for updates")) return
+    root.runAction(["check", p.id], "Checking " + p.name, p.id, "check", false)
+  }
+
+  // The one message behind everything the manager will not do to a linked
+  // plugin: it would have to write into the folder it points at.
+  function refuseLinked(p, verb) {
+    if (!p || !p.linked) return false
+    root.setStatus(p.name + " is a linked working copy; it is not " + verb + " here", false)
+    return true
   }
 
   function checkAll() {
@@ -513,6 +527,7 @@ Item {
   function updateCurrent() {
     var p = root.current
     if (!p) return
+    if (root.refuseLinked(p, "updated")) return
     if (p.update && !p.update.error && p.update.behind === 0) {
       root.setStatus(p.name + " is already up to date", false)
       return
@@ -702,6 +717,7 @@ Item {
   function askRemove() {
     var p = root.current
     if (!p || root.busy) return
+    if (root.refuseLinked(p, "removed")) return
     if (p.self) {
       root.setStatus("The Plugin Manager does not remove itself; use omarchy plugin remove", false)
       return
@@ -1101,6 +1117,7 @@ Item {
     if (p.version) parts.push("v" + p.version)
     if (p.git && p.git.branch) parts.push(p.git.branch)
     if (p.self) parts.push("this manager")
+    if (p.linked) parts.push("linked")
     if (!p.enabled) parts.push("disabled")
     return parts.join("  ·  ")
   }
@@ -1160,6 +1177,9 @@ Item {
 
   function updateLine(p) {
     if (!p) return { text: "", color: root.muted }
+    if (p.linked)
+      return { text: "Linked to " + root.homePath(p.linkTarget) + "  ·  updated where it lives, not here",
+               color: root.muted }
     var u = p.update
     if (!u) return { text: "Not checked for updates yet", color: root.muted }
     if (u.error) return { text: "Could not check: " + u.error, color: root.urgent }
@@ -1218,6 +1238,7 @@ Item {
     add("Id", p.id)
     if (p.manifestId && p.manifestId !== p.id) add("Manifest id", p.manifestId)
     add("Path", root.homePath(p.path), "folder")
+    if (p.linked) add("Linked to", root.homePath(p.linkTarget), "folder")
     return list
   }
 
@@ -1554,7 +1575,11 @@ Item {
               radius: root.cornerRadius
               color: row.selected ? root.selectedBackground : "transparent"
 
-              // A disabled plugin is greyed out: its avatar faded, its name muted.
+              // A disabled plugin is greyed out: its avatar faded, its name
+              // muted. A linked one reads the same way -- there is nothing to
+              // do to it here either.
+              readonly property bool dimmed: !row.modelData.enabled || row.modelData.linked === true
+
               Avatar {
                 id: avatar
                 anchors.left: parent.left
@@ -1562,7 +1587,7 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 width: root.avatarSize
                 height: root.avatarSize
-                opacity: row.modelData.enabled ? 1 : 0.45
+                opacity: row.dimmed ? 0.45 : 1
                 plugin: row.modelData
                 initials: root.initials(row.modelData)
               }
@@ -1580,7 +1605,7 @@ Item {
                   elide: Text.ElideRight
                   textFormat: Text.PlainText
                   text: row.modelData.name
-                  color: row.selected ? root.selectedText : (row.modelData.enabled ? root.foreground : root.muted)
+                  color: row.selected ? root.selectedText : (row.dimmed ? root.muted : root.foreground)
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                 }
@@ -1612,6 +1637,12 @@ Item {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
+                }
+
+                Pill {
+                  visible: row.modelData.linked === true
+                  text: "linked"
+                  tint: root.muted
                 }
 
                 Pill {
@@ -1697,7 +1728,9 @@ Item {
                     Text {
                       id: detailName
                       width: Math.min(implicitWidth,
-                                      parent.width - detailVersion.implicitWidth - detailStatus.width - parent.spacing * 2)
+                                      parent.width - detailVersion.implicitWidth - detailStatus.width
+                                      - (detailLinked.visible ? detailLinked.width + parent.spacing : 0)
+                                      - parent.spacing * 2)
                       elide: Text.ElideRight
                       textFormat: Text.PlainText
                       text: root.current ? root.current.name : ""
@@ -1724,6 +1757,14 @@ Item {
                       text: tag.text
                       tint: tag.tint
                       textColor: tag.textColor
+                    }
+
+                    Pill {
+                      id: detailLinked
+                      visible: root.currentIsLinked
+                      anchors.verticalCenter: detailName.verticalCenter
+                      text: "linked"
+                      tint: root.muted
                     }
                   }
 
@@ -1765,7 +1806,8 @@ Item {
                 Text {
                   readonly property var line: root.updateLine(root.current)
                   anchors.verticalCenter: parent.verticalCenter
-                  width: Math.min(implicitWidth, parent.width - checkButton.width - parent.spacing)
+                  width: Math.min(implicitWidth,
+                                  parent.width - (checkButton.visible ? checkButton.width + parent.spacing : 0))
                   wrapMode: Text.WordWrap
                   textFormat: Text.PlainText
                   text: line.text
@@ -1782,6 +1824,7 @@ Item {
                   fontSize: Style.font.caption
                   horizontalPadding: Style.spacing.md
                   verticalPadding: Style.spacing.xxs
+                  visible: !root.currentIsLinked
                   text: "Check"
                   tooltipText: "Look upstream for an update  (c)"
                   onClicked: root.checkCurrent()
@@ -2136,7 +2179,7 @@ Item {
             // Quiet like the rest: the confirmation is where it turns red.
             Button {
               id: removeButton
-              visible: !root.currentIsSelf
+              visible: !root.currentIsSelf && !root.currentIsLinked
               anchors.left: parent.left
               anchors.bottom: parent.bottom
               foreground: root.muted

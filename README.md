@@ -20,7 +20,15 @@ It manages **git plugins only**: the checkouts `omarchy plugin add` makes in
 - the built-in `omarchy.*` plugins
 - clones of built-ins
 - folders dropped in by hand
-- symlinks to working copies
+
+A **symlink to a working copy** -- a plugin linked in from the folder you are
+writing it in -- is the one in between. It is listed, greyed out and marked
+`linked`, so the list is the whole of what is installed rather than quietly
+short of one. You can read it, switch it on and off and give it a shortcut or
+a menu entry, since that is only your own config; checking, updating, rolling
+back and removing are refused, and it is left out of an export. Those would
+have to write into a folder you are working in, and that is git's job, not the
+manager's.
 
 The manager lists **itself** too, so it can check for, install and roll back
 its own updates. It will not switch itself off or remove itself; use
