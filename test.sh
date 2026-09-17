@@ -62,6 +62,9 @@ setPluginEnabled)
   echo ok
   ;;
 call) echo unknown ;;
+# $DISMISS_ON_SUMMON stands in for someone waving the overlay away the moment
+# a job puts it back on screen.
+summon) [[ -n ${DISMISS_ON_SUMMON:-} ]] && touch "$DISMISS_ON_SUMMON"; echo ok ;;
 *) echo ok ;;
 esac
 SHIM
@@ -753,6 +756,23 @@ check "a second run gets a new sequence number" ".seq != \"$seq1\" and .result.o
 holds "a run really does the work" '[[ ! -e $PLUGINS/test.broken ]]'
 out=$("$PM" run --label x -- bogus)
 check "a failing command still leaves a reply" '.ok == false' "$out"
+
+# The shim's overlay is never "loaded", so a resummon that is not called off
+# summons thirty times over; dismissing stops it at the first.
+unset PLUGIN_MANAGER_NO_SUMMON
+export DISMISS_ON_SUMMON="$STATE/dismissed"
+: >"$SHELL_LOG"
+"$PM" run --label "Checking" --id "" --kind check -- check --if-stale 999999 >/dev/null
+holds "a dismissed manager is not summoned back over and over" \
+  '[[ $(grep -c "^summon " "$SHELL_LOG") == 1 ]]'
+: >"$SHELL_LOG"
+touch "$STATE/dismissed"
+"$PM" run --label "Checking" --id "" --kind check -- check --if-stale 999999 >/dev/null
+holds "a dismissal from an earlier job is not held against this one" \
+  '[[ $(grep -c "^summon " "$SHELL_LOG") == 1 ]]'
+unset DISMISS_ON_SUMMON
+rm -f "$STATE/dismissed"
+export PLUGIN_MANAGER_NO_SUMMON=1
 
 # --------------------------------------------------------------- avatars
 # A curl that serves a PNG for any GitHub account but "ghost", and logs what

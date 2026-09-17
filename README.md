@@ -330,7 +330,9 @@ panel, this one included. So the overlay does not wait on them. It starts
 3. summons the manager back, which shows the result.
 
 The manager is gone for a second or two while the shell rebuilds its panels;
-no plugin can stay on screen through that.
+no plugin can stay on screen through that. Dismiss it while a job is still
+in flight and it stays dismissed: the job leaves the result in
+`last-action.json` rather than putting the overlay back on screen.
 
 Checks, reviews, reads, exports, import previews, shortcut changes and menu
 changes do not rescan, so they run directly.

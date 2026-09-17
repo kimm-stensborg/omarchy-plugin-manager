@@ -43,6 +43,9 @@ PLUGINS_DIR="$HOME/.config/omarchy/plugins"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/plugin-manager"
 CACHE="$CACHE_DIR/updates.json"
 AVATAR_DIR="$CACHE_DIR/avatars"
+# Touched by the overlay when the user dismisses it, so a job in flight stops
+# summoning it back (see resummon).
+DISMISSED="$CACHE_DIR/dismissed"
 MAX_COMMITS=20
 MAX_DIFF_LINES=3000
 MAX_README_BYTES=65536
@@ -1601,6 +1604,10 @@ cmd_run() {
   exec 7>"$CACHE_DIR/action.lock"
   flock 7
 
+  # Any dismiss from here on is the user turning down the manager this job
+  # would otherwise bring back.
+  rm -f "$DISMISSED"
+
   seq=$(date +%s%N)
   jq -cn --arg seq "$seq" --arg label "$label" --arg id "$id" --arg kind "$kind" --arg now "$(date -Iseconds)" \
     '{seq: $seq, label: $label, id: $id, kind: $kind, startedAt: $now}' >"$CACHE_DIR/running.json.tmp" &&
@@ -1639,15 +1646,23 @@ loaded() {
 # counts once it has kept answering for three seconds; until then, whenever it
 # is gone, summon it again. An overlay that survives is left alone -- it polls
 # last-action.json and shows the result itself.
+#
+# A gone overlay is only worth summoning while the shell is the one taking it
+# away. Once the user has dismissed it -- Esc, a click outside, or an action
+# that closes the manager to open something else -- the marker file says so,
+# and this stops: otherwise the job spends the next half minute putting the
+# overlay back on screen every time it is waved off.
 resummon() {
   local payload="$1" i pause stable
   for ((i = 0; i < 30; i++)); do
+    [[ -e $DISMISSED ]] && return 0
     loaded || omarchy-shell shell summon "$SELF_ID" "$payload" >/dev/null 2>&1
     sleep 0.4
     loaded || continue
     stable=1
     for pause in 0.6 1 1.4; do
       sleep "$pause"
+      [[ -e $DISMISSED ]] && return 0
       loaded || {
         stable=0
         break

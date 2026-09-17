@@ -283,7 +283,13 @@ Item {
 
   // User-initiated closes go through the host so its open-panel state stays in
   // step, and land back in close().
+  //
+  // A detached job summons the manager back when the shell's rescan tears it
+  // down, and cannot otherwise tell that teardown from someone waving the
+  // overlay away. Leaving a mark here says which this was, so a job in flight
+  // stops bringing it back.
   function dismiss() {
+    Quickshell.execDetached(["sh", "-c", "mkdir -p \"$1\" && touch \"$1/dismissed\"", "sh", root.stateDir])
     if (root.shell && typeof root.shell.hide === "function") root.shell.hide(root.pluginId)
     else root.close()
   }
