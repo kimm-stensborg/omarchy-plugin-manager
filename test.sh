@@ -816,6 +816,75 @@ out=$("$PM" avatars)
 check "a second run fetches nothing" '.fetched == [] and .failed == []' "$out"
 holds "and asks for neither the one it has nor the one that failed" '[[ $(wc -l <"$CURL_LOG") == "$calls" ]]'
 
+# An avatar a day old is fetched again; the same picture does not count as
+# fetched, and a new one does.
+touch -d '2 days ago' "$AVATARS/octo-cat.png"
+check "an avatar a day old is due again" \
+  '.plugins[] | select(.id == "test.kappa") | .avatarStale == true' "$("$PM" list)"
+out=$("$PM" avatars)
+check "the same picture fetched again is not news" '.fetched == []' "$out"
+check "but it is no longer due, and the list stamps when it was fetched" \
+  '.plugins[] | select(.id == "test.kappa") | .avatarStale == false and .avatarStamp > 0' "$("$PM" list)"
+printf 'old' >"$AVATARS/octo-cat.png"
+touch -d '2 days ago' "$AVATARS/octo-cat.png"
+out=$("$PM" avatars)
+check "a changed picture is fetched and said so" '.fetched == ["Octo-Cat"]' "$out"
+holds "and replaces the old one" 'cmp -s "$AVATARS/octo-cat.png" <(printf "\x89PNG\r\n\x1a\nfake")'
+
+# ------------------------------------------------------------- shell log
+export PLUGIN_MANAGER_SHELL_LOG="$SANDBOX/shell-log.log"
+cat >"$PLUGIN_MANAGER_SHELL_LOG" <<LOG
+2026-10-06 18:33:00.729  WARN scene: QML IpcHandler at file:///usr/share/x.qml[27:3]: Handler was registered but will not be used
+2026-10-06 18:34:00.100  WARN scene: Plugin widget test.kappa failed: file://$PLUGINS/test.kappa/BarWidget.qml:12:3: Type Foo unavailable
+file://$PLUGINS/test.kappa/Foo.qml:3:1: Expected token
+2026-10-06 18:35:00.100  INFO scene: test.alpha says hello, nothing failed
+2026-10-06 18:36:00.100  WARN scene: QML Text at file://$PLUGINS/test.alpha/Overlay.qml[3:1]: Binding loop detected for property "text"
+2026-10-06 18:37:00.100  WARN scene: file://$SANDBOX/link-work/Overlay.qml:9: TypeError: Cannot read property 'x' of null
+2026-10-06 18:38:00.100  WARN scene: file://$PLUGINS/test.kappa-extra/Overlay.qml:1: ReferenceError: y is not defined
+LOG
+out=$("$PM" list)
+check "a load failure in the shell log is pinned on its plugin, with the lines that continue it, paths from its folder" \
+  '.plugins[] | select(.id == "test.kappa") | .logErrors == [{time: "18:34:00", text: "Plugin widget test.kappa failed: BarWidget.qml:12:3: Type Foo unavailable\nFoo.qml:3:1: Expected token"}]' "$out"
+check "an error in a linked plugin is found by where it is linked to" \
+  '.plugins[] | select(.id == "test.link") | .logErrors[0].text | startswith("Overlay.qml:9: TypeError")' "$out"
+check "info lines and binding loops are not errors" \
+  '.plugins[] | select(.id == "test.alpha") | .logErrors == []' "$out"
+PLUGIN_MANAGER_SHELL_LOG="$SANDBOX/no-such.log"
+check "with no log there are no errors" 'all(.plugins[]; .logErrors == [])' "$("$PM" list)"
+unset PLUGIN_MANAGER_SHELL_LOG
+
+# ------------------------------------------------------------ update-all
+# Two plugins one commit behind, and a third whose upstream has gone away.
+for name in one two three; do
+  git init -q --bare -b main "$SANDBOX/$name.git"
+  write_plugin "$SANDBOX/$name-work" "test.$name" 1.0.0
+  git -C "$SANDBOX/$name-work" init -q -b main
+  commit_all "$SANDBOX/$name-work" "Initial"
+  git -C "$SANDBOX/$name-work" remote add origin "$SANDBOX/$name.git"
+  git -C "$SANDBOX/$name-work" push -q origin main
+  git clone -q "$SANDBOX/$name.git" "$PLUGINS/test.$name"
+  write_plugin "$SANDBOX/$name-work" "test.$name" 1.1.0
+  commit_all "$SANDBOX/$name-work" "Bump"
+  git -C "$SANDBOX/$name-work" push -q origin main
+done
+"$PM" check >/dev/null
+rm -rf "$SANDBOX/three.git"
+out=$("$PM" update-all)
+check "update-all updates what the check found behind, and goes on past one that fails" \
+  '.ok == false and (.message | test("^Updated [0-9]+ plugins?; 1 update failed$"))
+   and ([.results[] | select(.ok) | .id] | index("test.one") != null and index("test.two") != null)
+   and ([.results[] | select(.ok | not) | .id] == ["test.three"])' "$out"
+check "and asks for one restart, since they moved" '.restart == true' "$out"
+holds "the failed one is named in the output" 'jq -r .output <<<"$out" | grep -q "^test.three name: "'
+check "they are at the new version" \
+  '[.plugins[] | select(.id == "test.one" or .id == "test.two") | .version] == ["1.1.0", "1.1.0"]' "$("$PM" list)"
+check "a linked plugin is never among them" '[.results[].id] | index("test.link") == null' "$out"
+rm -rf "$PLUGINS/test.three"
+"$PM" check >/dev/null
+out=$("$PM" update-all)
+check "with nothing behind, update-all says so and restarts nothing" \
+  '.ok == true and .message == "No plugin has an update waiting" and .restart == false' "$out"
+
 out=$("$PM" bogus)
 check "an unknown command fails as JSON" '.ok == false' "$out"
 

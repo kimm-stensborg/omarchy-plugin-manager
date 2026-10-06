@@ -11,6 +11,7 @@
 #   plugin-manager review <id>
 #   plugin-manager inspect <id>
 #   plugin-manager update <id>
+#   plugin-manager update-all
 #   plugin-manager rollback <id>
 #   plugin-manager remove <id>
 #   plugin-manager add <git-url>
@@ -43,6 +44,9 @@ PLUGINS_DIR="$HOME/.config/omarchy/plugins"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/plugin-manager"
 CACHE="$CACHE_DIR/updates.json"
 AVATAR_DIR="$CACHE_DIR/avatars"
+# An avatar is fetched again once it is this old, in seconds: people change
+# their picture, and a day-old one is soon enough to notice.
+AVATAR_MAX_AGE=86400
 # Touched by the overlay when the user dismisses it, so a job in flight stops
 # summoning it back (see resummon).
 DISMISSED="$CACHE_DIR/dismissed"
@@ -396,9 +400,48 @@ menu_markers_json() {
     }' "$MENU_USER" | jq -Rsc '[split("\n")[] | select(length > 0) | split("\t") | {plugin: .[0], entry: .[1], by: .[2]}]'
 }
 
-# The avatars fetched so far, as file names.
+# The avatars fetched so far: file name → when it was last fetched, in epoch
+# seconds.
 avatar_files_json() {
-  find "$AVATAR_DIR" -maxdepth 1 -name '*.png' -printf '%f\n' 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0))'
+  find "$AVATAR_DIR" -maxdepth 1 -name '*.png' -printf '%f\t%T@\n' 2>/dev/null |
+    jq -Rsc '[split("\n")[] | select(length > 0) | split("\t") | {key: .[0], value: (.[1] | tonumber | floor)}] | from_entries'
+}
+
+# The log of the running omarchy-shell: the newest quickshell instance's.
+# PLUGIN_MANAGER_SHELL_LOG names another, for the tests.
+shell_log_file() {
+  if [[ -n ${PLUGIN_MANAGER_SHELL_LOG:-} ]]; then
+    printf '%s\n' "$PLUGIN_MANAGER_SHELL_LOG"
+    return
+  fi
+  local dir="${XDG_RUNTIME_DIR:-/run/user/$UID}/quickshell/by-id"
+  find "$dir" -mindepth 2 -maxdepth 2 -name log.log -printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -1 | cut -f2-
+}
+
+# The errors in the shell's log, as [{time, text}]: warnings and worse that
+# read as something going wrong, each with the lines that continue it (a
+# compile error lists its causes on the lines after it). Binding loops and
+# handlers registered twice are noise, and left out. The overlay matches them
+# to plugins.
+shell_log_json() {
+  local file
+  file=$(shell_log_file)
+  [[ -n $file && -r $file ]] || {
+    echo '[]'
+    return
+  }
+  awk '
+    function flush() { if (entry != "") print entry; entry = "" }
+    /^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:.]+ +(WARN|ERROR|CRIT|FATAL) / { flush(); entry = $0; next }
+    /^[0-9]{4}-[0-9]{2}-[0-9]{2} / { flush(); next }
+    entry != "" { entry = entry "\x1f" $0 }
+    END { flush() }
+  ' "$file" | tail -n 2000 | jq -Rsc '
+    [ split("\n")[] | select(length > 0)
+      | capture("^[0-9-]+ (?<time>[0-9]{2}:[0-9]{2}:[0-9]{2})[0-9.]* +[A-Z]+ +(?<text>.*)$"; "s")
+      | .text |= (gsub("\u001f"; "\n") | sub("^[a-z.]+: "; ""))
+      | select(.text | test("fail|error|is not a type|is not defined|is not a function|unavailable|cannot|unable|not found|no such"; "i"))
+      | select(.text | test("Binding loop|Handler was registered"; "i") | not) ]'
 }
 
 cmd_list() {
@@ -422,6 +465,8 @@ cmd_list() {
     --argjson live "$(live_binds_json)" --argjson menu "$(menu_entries_json)" \
     --argjson menuMarks "$(menu_markers_json)" \
     --arg avatarDir "$AVATAR_DIR" --argjson avatars "$(avatar_files_json)" \
+    --argjson avatarAge "$AVATAR_MAX_AGE" --argjson now "$(date +%s)" \
+    --argjson logs "$(shell_log_json)" \
     --argjson config "$config" --arg braces "'{}'" "$JQ_KEYS"'
     def eid: if type == "object" then (.id // "") else tostring end;
     # "someone" from https://github.com/someone/repo, git@github.com:someone/repo.git
@@ -430,6 +475,12 @@ cmd_list() {
       [capture("^(?:https?://(?:[^@/]+@)?github\\.com/|git@github\\.com:|ssh://git@github\\.com/)(?<o>[A-Za-z0-9][A-Za-z0-9-]*)/")]
       | .[0].o // null;
     def esc: gsub("(?<c>[.*+?^$()\\[\\]{}|\\\\])"; "\\\(.c)");
+    # A log line is about a plugin when it names a file in its folder, or its
+    # id as a word on its own.
+    def mentionsplugin($p):
+      contains("/plugins/" + $p.id + "/")
+      or (($p.linkTarget // "") as $t | $t != "" and contains($t + "/"))
+      or test("(^|[^A-Za-z0-9._-])" + ($p.id | esc) + "([^A-Za-z0-9._-]|$)");
     # A command belongs to a plugin when it names its id or runs one of its scripts.
     def mentions($p):
       . as $cmd
@@ -485,10 +536,21 @@ cmd_list() {
               then "omarchy-shell shell toggle \($p.id) \($braces)"
               else "" end)
         # The GitHub account of its author, from a github.com remote, and the
-        # avatar fetched for it by the avatars command, if there is one yet.
+        # avatar fetched for it by the avatars command, if there is one yet:
+        # with when it was fetched, which the overlay puts in the image URL so
+        # a new picture is not hidden behind the old one, and whether it is
+        # due to be fetched again.
         | .owner = ((.git.remote // "") | ghowner)
-        | .avatar = (if .owner != null and any($avatars[]; . == ($p.git.remote // "" | ghowner // "" | ascii_downcase) + ".png")
-                     then "\($avatarDir)/\(.owner | ascii_downcase).png" else "" end))
+        | ((.owner // "" | ascii_downcase) + ".png") as $file
+        | .avatar = (if .owner != null and $avatars[$file] != null then "\($avatarDir)/\($file)" else "" end)
+        | .avatarStamp = (if .avatar != "" then $avatars[$file] else 0 end)
+        | .avatarStale = (.owner != null and (.avatar == "" or $now - .avatarStamp > $avatarAge))
+        # What the running shell logged against it: compile errors, a load
+        # that failed, a TypeError while it ran.
+        # Paths into the plugin read as paths from its own folder.
+        | .logErrors = [ $logs[] | select(.text | mentionsplugin($p))
+                         | .text |= (gsub("(file://)?[^ \n]*/plugins/" + ($p.id | esc) + "/"; "")
+                                     | if ($p.linkTarget // "") != "" then gsub("(file://)?" + ($p.linkTarget | esc) + "/"; "") else . end) ][-5:])
     | sort_by(.name | ascii_downcase)
     | {ok: true, checkedAt: ($cache.checkedAt // null), plugins: .}'
 }
@@ -497,8 +559,9 @@ cmd_list() {
 
 # avatars -- fetch the GitHub avatar of each account the list names as an
 # owner into the cache, for the overlay to show beside its plugins. One is
-# fetched when it is missing or a week old; one that failed is not asked for
-# again for a day. Only what reads as a PNG or a JPEG is kept.
+# fetched when it is missing or a day old; one that failed is not asked for
+# again for a day. Only what reads as a PNG or a JPEG is kept, and "fetched"
+# only names the ones whose picture actually changed.
 cmd_avatars() {
   local owner key file tmp magic fetched=() failed=()
   mkdir -p "$AVATAR_DIR"
@@ -506,14 +569,19 @@ cmd_avatars() {
     [[ -n $owner ]] || continue
     key="${owner,,}"
     file="$AVATAR_DIR/$key.png"
-    [[ -f $file && -z $(find "$file" -mmin +10080 2>/dev/null) ]] && continue
+    [[ -f $file && -z $(find "$file" -mmin +$((AVATAR_MAX_AGE / 60)) 2>/dev/null) ]] && continue
     [[ -n $(find "$AVATAR_DIR/.$key.failed" -mmin -1440 2>/dev/null) ]] && continue
     tmp=$(mktemp "$AVATAR_DIR/.fetch.XXXXXX")
     if curl -fsSL --max-time 10 -o "$tmp" "https://github.com/$owner.png?size=96" 2>/dev/null &&
       magic=$(head -c 4 "$tmp" | od -An -tx1 | tr -d ' \n') && [[ $magic == 89504e47 || $magic == ffd8ff* ]]; then
-      mv -f "$tmp" "$file"
+      if cmp -s "$tmp" "$file"; then
+        rm -f "$tmp"
+        touch "$file"
+      else
+        mv -f "$tmp" "$file"
+        fetched+=("$owner")
+      fi
       rm -f "$AVATAR_DIR/.$key.failed"
-      fetched+=("$owner")
     else
       rm -f "$tmp"
       touch "$AVATAR_DIR/.$key.failed"
@@ -786,6 +854,38 @@ cmd_update() {
 # and the update it undid shows as waiting again. The plugin must still be
 # where that update left it, with no changes of its own, and the old version
 # must still pass the validator the shell holds plugins to.
+# update-all -- update every plugin the last check found behind, one after
+# the other, each as `update` would. One that fails does not stop the rest;
+# the reply lists every result, and asks for a single restart when any of
+# them moved.
+cmd_update_all() {
+  local id out results=() names=() failed=() restart=false
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    out=$(cmd_update "$id")
+    results+=("$out")
+    if jq -e '.ok' >/dev/null 2>&1 <<<"$out"; then
+      names+=("$(plugin_name "$id")")
+      jq -e '.restart == true' >/dev/null 2>&1 <<<"$out" && restart=true
+    else
+      failed+=("$(plugin_name "$id"): $(jq -r '.message // "failed"' <<<"$out")")
+    fi
+  done < <(read_cache | jq -r '(.plugins // {}) | to_entries[] | select((.value.behind // 0) > 0) | .key' |
+    while IFS= read -r id; do is_git_plugin "$id" && ! is_linked_plugin "$id" && printf '%s\n' "$id"; done)
+
+  local message details
+  if ((${#results[@]} == 0)); then
+    message="No plugin has an update waiting"
+  elif ((${#failed[@]} == 0)); then
+    message="Updated $(plural ${#names[@]} plugin)"
+  else
+    message="Updated $(plural ${#names[@]} plugin); $(plural ${#failed[@]} update) failed"
+  fi
+  details=$( ((${#failed[@]} == 0)) || printf '%s\n' "${failed[@]}")
+  reply "$(((${#failed[@]} == 0)) && echo true || echo false)" "$message" "$details" \
+    "$(printf '%s\n' "${results[@]}" | jq -cs --argjson restart "$restart" '{restart: $restart, results: .}')"
+}
+
 cmd_rollback() {
   local id="${1:-}" dir name record from to out
   require_managed "$id"
@@ -1623,11 +1723,12 @@ cmd_run() {
 
   if [[ -z ${PLUGIN_MANAGER_NO_SUMMON:-} ]]; then
     # Self-update always restarts; any other action says so with `restart`,
-    # which an update sets when the checkout actually moved. Either way the
+    # which an update sets when the checkout actually moved -- update-all
+    # even when another of its updates failed. Either way the
     # resummon below brings the manager back to show the result.
     if { [[ $kind == self-update ]] &&
       jq -e '.ok and (.message | test("^(Updated|Rolled back)"))' >/dev/null 2>&1 <<<"$out"; } ||
-      jq -e '.ok and (.restart == true)' >/dev/null 2>&1 <<<"$out"; then
+      jq -e '.restart == true' >/dev/null 2>&1 <<<"$out"; then
       omarchy-restart-shell >/dev/null 2>&1 || true
     fi
     resummon "$(jq -cn --arg seq "$seq" '{resume: $seq}')"
@@ -1685,6 +1786,7 @@ check) cmd_check "$@" ;;
 review) cmd_review "$@" ;;
 inspect) cmd_inspect "$@" ;;
 update) cmd_update "$@" ;;
+update-all) cmd_update_all ;;
 rollback) cmd_rollback "$@" ;;
 remove) cmd_remove "$@" ;;
 add) cmd_add "$@" ;;

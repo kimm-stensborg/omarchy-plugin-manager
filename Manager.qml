@@ -84,6 +84,7 @@ Item {
   property string pendingInspect: ""
 
   property bool confirmingRollback: false
+  property bool confirmingUpdateAll: false
 
   // The shortcut dialog, and what the backend made of the keys typed into it.
   property bool binding: false
@@ -125,7 +126,22 @@ Item {
   // Relative times ("checked 4 min ago") re-read this while open.
   property real now: Date.now()
 
-  readonly property var current: root.selectedIndex >= 0 && root.selectedIndex < root.plugins.length
+  // The field above the list filters it, unless what is typed there is a git
+  // URL or a path to add. The list shows the plugins that match, by their
+  // index in `plugins`; a plugin filtered out is not selected.
+  readonly property string filterText: urlField.text.trim() !== "" && !root.looksLikeSource(urlField.text.trim())
+    ? urlField.text.trim().toLowerCase() : ""
+  readonly property var shown: {
+    var out = []
+    for (var i = 0; i < root.plugins.length; i++)
+      if (root.matchesFilter(root.plugins[i], root.filterText)) out.push(i)
+    return out
+  }
+  onShownChanged: {
+    if (root.shown.length > 0 && root.shown.indexOf(root.selectedIndex) === -1) root.select(root.shown[0])
+  }
+
+  readonly property var current: root.shown.indexOf(root.selectedIndex) !== -1
     ? root.plugins[root.selectedIndex] : null
   readonly property bool currentIsSelf: root.current !== null && root.current.self === true
   // A linked plugin lives in a folder someone is working in: it is shown and
@@ -138,6 +154,11 @@ Item {
     for (var i = 0; i < root.plugins.length; i++) if (root.behind(root.plugins[i]) > 0) n++
     return n
   }
+  // What Update all would update: what the last check found behind. A linked
+  // plugin is never checked, so it is never among them.
+  readonly property var updatable: root.plugins.filter(function(p) {
+    return root.behind(p) > 0 && !p.linked
+  })
 
   // Theme: the same [menu] surface tokens the Omarchy menu uses.
   readonly property color background: Color.menu.background
@@ -195,7 +216,10 @@ Item {
     Image {
       id: avatarImage
       anchors.fill: parent
-      source: avatarRoot.plugin && avatarRoot.plugin.avatar ? Util.fileUrl(avatarRoot.plugin.avatar) : ""
+      // Stamped with when it was fetched: the same URL would keep showing
+      // the picture already loaded after a new one replaced it on disk.
+      source: avatarRoot.plugin && avatarRoot.plugin.avatar
+        ? Util.fileUrl(avatarRoot.plugin.avatar) + "?" + avatarRoot.plugin.avatarStamp : ""
       sourceSize.width: 128
       sourceSize.height: 128
       fillMode: Image.PreserveAspectCrop
@@ -248,6 +272,8 @@ Item {
     root.opened = true
     root.closeDialogs()
     root.now = Date.now()
+    root.avatarsAsked = false
+    if (!payload.resume && root.filterText !== "") urlField.text = ""
     if (payload.select) root.selectId = String(payload.select)
     if (payload.status) root.setStatus(String(payload.status), payload.error === true)
     root.syncJobs(true, payload.resume ? String(payload.resume) : "")
@@ -270,6 +296,7 @@ Item {
   function closeDialogs() {
     root.confirmingRemove = false
     root.confirmingRollback = false
+    root.confirmingUpdateAll = false
     root.importPreview = null
     root.importChosen = ({})
     root.reviewing = false
@@ -349,11 +376,11 @@ Item {
     root.fetchAvatars()
   }
 
-  // Fetch the GitHub avatars the list is missing, once per load and in the
-  // background; the list is read again when any came in.
+  // Fetch the GitHub avatars the list is missing or has had for a day, once
+  // per load and in the background; the list is read again when any changed.
   function fetchAvatars() {
     if (root.avatarsAsked || avatarProc.running) return
-    if (!root.plugins.some(function(p) { return p.owner && !p.avatar })) return
+    if (!root.plugins.some(function(p) { return p.avatarStale })) return
     root.avatarsAsked = true
     avatarProc.running = true
   }
@@ -720,6 +747,49 @@ Item {
                    (p.enabled ? "Disabling " : "Enabling ") + p.name, p.id, "toggle", false)
   }
 
+  // A git URL (https, ssh, git@host:…), a local path, or an export file:
+  // something to add rather than something to look for.
+  function looksLikeSource(text) {
+    return /^[a-z][a-z0-9+.-]*:\/\//i.test(text) || /^[\w.-]+@[\w.-]+:/.test(text)
+      || /^[~\/.]/.test(text) || /\.git$/i.test(text) || /\.json$/i.test(text)
+  }
+
+  function matchesFilter(p, filter) {
+    if (!filter) return true
+    return [p.name, p.id, p.description, p.author, p.owner].some(function(field) {
+      return field && String(field).toLowerCase().indexOf(filter) !== -1
+    })
+  }
+
+  function askUpdateAll() {
+    if (root.busy) return
+    if (root.updatable.length === 0) {
+      root.setStatus("No plugin has an update waiting", false)
+      return
+    }
+    confirm.selectedIndex = 0
+    root.confirmingUpdateAll = true
+  }
+
+  function updateAllMessage() {
+    var lines = root.updatable.map(function(p) {
+      var n = root.behind(p)
+      return "  " + p.name + "  ·  " + n + " new commit" + (n === 1 ? "" : "s")
+        + (p.update.remoteVersion && p.update.remoteVersion !== p.version ? ", v" + p.update.remoteVersion : "")
+    })
+    return "Update " + (lines.length === 1 ? "this plugin" : "these " + lines.length + " plugins") + "?\n\n"
+      + lines.join("\n")
+      + "\n\nThe shell restarts afterwards. To read an update first, select it and press u."
+  }
+
+  function updateAll() {
+    root.confirmingUpdateAll = false
+    keyCatcher.forceActiveFocus()
+    var n = root.updatable.length
+    if (n === 0) return
+    root.runAction(["update-all"], "Updating " + n + " plugin" + (n === 1 ? "" : "s"), "", "update-all", false)
+  }
+
   function askRemove() {
     var p = root.current
     if (!p || root.busy) return
@@ -745,6 +815,10 @@ Item {
     var text = urlField.text.trim()
     if (!text) {
       urlField.forceActiveFocus()
+      return
+    }
+    if (!root.looksLikeSource(text)) {
+      root.setStatus("“" + text + "” filters the list; paste a git URL to add a plugin", false)
       return
     }
     if (/\.json$/i.test(text)) root.previewImport(text)
@@ -1087,12 +1161,18 @@ Item {
     root.statusError = isError === true
   }
 
-  function move(delta) { root.select(root.selectedIndex + delta) }
+  function move(delta) {
+    if (root.shown.length === 0) return
+    var at = root.shown.indexOf(root.selectedIndex)
+    if (at === -1) at = delta > 0 ? -1 : root.shown.length
+    root.select(root.shown[Math.max(0, Math.min(root.shown.length - 1, at + delta))])
+  }
 
   function select(index) {
     if (root.plugins.length === 0) return
     root.selectedIndex = Math.max(0, Math.min(root.plugins.length - 1, index))
-    pluginList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
+    var at = root.shown.indexOf(root.selectedIndex)
+    if (at !== -1) pluginList.positionViewAtIndex(at, ListView.Contain)
     details.contentY = 0
   }
 
@@ -1279,23 +1359,25 @@ Item {
       event.accepted = true
       return
     }
-    if (root.confirmingRemove || root.confirmingRollback) {
+    if (root.confirmingRemove || root.confirmingRollback || root.confirmingUpdateAll) {
       confirm.handleKey(event)
       event.accepted = true
       return
     }
     var key = event.key
     var t = event.text
-    if (key === Qt.Key_Escape) root.dismiss()
+    if (key === Qt.Key_Escape && urlField.text !== "") urlField.text = ""
+    else if (key === Qt.Key_Escape) root.dismiss()
     else if (key === Qt.Key_Up || t === "k") root.move(-1)
     else if (key === Qt.Key_Down || t === "j") root.move(1)
-    else if (key === Qt.Key_Home) root.select(0)
-    else if (key === Qt.Key_End) root.select(root.plugins.length - 1)
+    else if (key === Qt.Key_Home) root.move(-root.plugins.length)
+    else if (key === Qt.Key_End) root.move(root.plugins.length)
     else if (key === Qt.Key_Return || key === Qt.Key_Enter) root.openPlugin()
     else if (t === "i") root.inspectCurrent()
     else if (t === "c") root.checkCurrent()
     else if (t === "C") root.checkAll()
     else if (t === "u") root.updateCurrent()
+    else if (t === "U") root.askUpdateAll()
     else if (t === "b") root.askRollback()
     else if (t === "e") root.toggleEnabled()
     else if (t === "s") root.askBind()
@@ -1483,12 +1565,27 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               text: {
-                var parts = [root.plugins.length + " installed"]
+                var parts = [root.filterText !== ""
+                  ? root.shown.length + " of " + root.plugins.length + " shown"
+                  : root.plugins.length + " installed"]
                 if (root.updateCount > 0)
                   parts.push(root.updateCount === 1 ? "1 update" : root.updateCount + " updates")
                 parts.push(root.checkedAt ? "checked " + root.ago(root.checkedAt) : "not checked yet")
                 return parts.join("  ·  ")
               }
+            }
+
+            Button {
+              anchors.verticalCenter: parent.verticalCenter
+              visible: root.updatable.length > 0
+              foreground: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              horizontalPadding: Style.spacing.md
+              verticalPadding: Style.spacing.xxs
+              text: "Update all"
+              tooltipText: "Install every waiting update, after a list of what it brings  (U)"
+              onClicked: root.askUpdateAll()
             }
 
             Button {
@@ -1518,8 +1615,15 @@ Item {
             anchors.rightMargin: Style.spacing.controlGap
             anchors.verticalCenter: parent.verticalCenter
             foreground: root.foreground
-            placeholderText: "Git URL of a plugin to add  (a)"
-            onAccepted: root.addPlugin()
+            placeholderText: "Filter, or paste a git URL to add  (/)"
+            // A filter hands the keys back to the list, which keeps it; a URL
+            // is added.
+            onAccepted: {
+              if (root.looksLikeSource(urlField.text.trim())) root.addPlugin()
+              else keyCatcher.forceActiveFocus()
+            }
+            Keys.onUpPressed: function(event) { root.move(-1); event.accepted = true }
+            Keys.onDownPressed: function(event) { root.move(1); event.accepted = true }
             Keys.onEscapePressed: function(event) {
               if (urlField.text) urlField.text = ""
               else keyCatcher.forceActiveFocus()
@@ -1559,22 +1663,35 @@ Item {
             font.pixelSize: Style.font.body
           }
 
+          Text {
+            anchors { left: pluginList.left; right: pluginList.right; top: parent.top; topMargin: Style.space(12) }
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+            visible: root.plugins.length > 0 && root.shown.length === 0
+            textFormat: Text.PlainText
+            text: "No plugin matches “" + urlField.text.trim() + "”"
+            color: root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
           ListView {
             id: pluginList
             anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
             width: Math.round(parent.width * 0.36)
             clip: true
             spacing: Style.spacing.xxs
-            model: root.plugins
+            model: root.shown
             visible: root.plugins.length > 0
             boundsBehavior: Flickable.StopAtBounds
 
             delegate: Rectangle {
               id: row
-              required property int index
-              required property var modelData
-              readonly property bool selected: row.index === root.selectedIndex
-              readonly property bool working: root.busy && (root.jobId === row.modelData.id || root.busyId === row.modelData.id)
+              // The plugin's index in root.plugins.
+              required property int modelData
+              readonly property var plugin: root.plugins[row.modelData] || ({})
+              readonly property bool selected: row.modelData === root.selectedIndex
+              readonly property bool working: root.busy && (root.jobId === row.plugin.id || root.busyId === row.plugin.id)
 
               width: pluginList.width
               height: root.rowHeight
@@ -1584,7 +1701,7 @@ Item {
               // A disabled plugin is greyed out: its avatar faded, its name
               // muted. A linked one reads the same way -- there is nothing to
               // do to it here either.
-              readonly property bool dimmed: !row.modelData.enabled || row.modelData.linked === true
+              readonly property bool dimmed: !row.plugin.enabled || row.plugin.linked === true
 
               Avatar {
                 id: avatar
@@ -1594,8 +1711,8 @@ Item {
                 width: root.avatarSize
                 height: root.avatarSize
                 opacity: row.dimmed ? 0.45 : 1
-                plugin: row.modelData
-                initials: root.initials(row.modelData)
+                plugin: row.plugin
+                initials: root.initials(row.plugin)
               }
 
               Column {
@@ -1610,7 +1727,7 @@ Item {
                   width: parent.width
                   elide: Text.ElideRight
                   textFormat: Text.PlainText
-                  text: row.modelData.name
+                  text: row.plugin.name
                   color: row.selected ? root.selectedText : (row.dimmed ? root.muted : root.foreground)
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -1620,7 +1737,7 @@ Item {
                   width: parent.width
                   elide: Text.ElideRight
                   textFormat: Text.PlainText
-                  text: root.subtitle(row.modelData)
+                  text: root.subtitle(row.plugin)
                   color: root.muted
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1646,21 +1763,22 @@ Item {
                 }
 
                 Pill {
-                  visible: row.modelData.linked === true
+                  visible: row.plugin.linked === true
                   text: "linked"
                   tint: root.muted
                 }
 
                 Pill {
-                  visible: root.behind(row.modelData) > 0
-                  text: "↑ " + root.behind(row.modelData)
+                  visible: root.behind(row.plugin) > 0
+                  text: "↑ " + root.behind(row.plugin)
                   tint: root.accent
                   bold: true
                 }
 
                 Pill {
-                  visible: !row.modelData.valid || (row.modelData.git && row.modelData.git.dirty)
-                    || (row.modelData.update && row.modelData.update.error !== "")
+                  visible: !row.plugin.valid || (row.plugin.git && row.plugin.git.dirty)
+                    || (row.plugin.update && row.plugin.update.error !== "")
+                    || (row.plugin.logErrors && row.plugin.logErrors.length > 0)
                   text: "!"
                   tint: root.urgent
                   bold: true
@@ -1671,7 +1789,7 @@ Item {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
-                  root.select(row.index)
+                  root.select(row.modelData)
                   keyCatcher.forceActiveFocus()
                 }
               }
@@ -1849,6 +1967,44 @@ Item {
                   color: root.urgent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
+                }
+              }
+
+              // What the running shell logged against it, newest last: a
+              // component that failed to compile, an error while it ran.
+              Column {
+                width: parent.width
+                spacing: Style.spacing.xs
+                visible: root.current !== null && (root.current.logErrors || []).length > 0
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: {
+                    var n = root.current && root.current.logErrors ? root.current.logErrors.length : 0
+                    return "⚠ The shell logged " + (n === 1 ? "an error" : n + " errors") + " for it since it started"
+                  }
+                  color: root.urgent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Repeater {
+                  model: root.current && root.current.logErrors ? root.current.logErrors : []
+
+                  Text {
+                    required property var modelData
+                    width: detailsColumn.width
+                    wrapMode: Text.WrapAnywhere
+                    maximumLineCount: 6
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    text: modelData.time + "  " + modelData.text
+                    color: root.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
                 }
               }
 
@@ -2323,8 +2479,8 @@ Item {
             spacing: Style.spacing.lg
 
             Repeater {
-              model: ["esc close", "⏎ open", "i read", "s shortcut", "m menu", "c check", "u update", "b roll back",
-                      "e enable", "d remove", "o repo", "a add", "x export", "I import"]
+              model: ["esc close", "⏎ open", "/ filter or add", "i read", "s shortcut", "m menu", "c check", "u update",
+                      "U update all", "b roll back", "e enable", "d remove", "o repo", "x export", "I import"]
 
               Text {
                 required property string modelData
@@ -2344,14 +2500,15 @@ Item {
       ConfirmDialog {
         id: confirm
         anchors.fill: parent
-        opened: root.confirmingRemove || root.confirmingRollback
+        opened: root.confirmingRemove || root.confirmingRollback || root.confirmingUpdateAll
         background: root.background
         foreground: root.foreground
         fontFamily: root.fontFamily
         cornerRadius: root.cornerRadius
         cancelText: "Cancel"
-        confirmText: root.confirmingRollback ? "Roll back" : "Remove"
+        confirmText: root.confirmingUpdateAll ? "Update all" : (root.confirmingRollback ? "Roll back" : "Remove")
         message: {
+          if (root.confirmingUpdateAll) return root.updateAllMessage()
           if (root.confirmingRollback) return root.rollbackMessage()
           var p = root.current
           if (!p) return ""
@@ -2360,10 +2517,12 @@ Item {
         onCanceled: {
           root.confirmingRemove = false
           root.confirmingRollback = false
+          root.confirmingUpdateAll = false
           keyCatcher.forceActiveFocus()
         }
         onConfirmed: {
-          if (root.confirmingRollback) root.rollbackCurrent()
+          if (root.confirmingUpdateAll) root.updateAll()
+          else if (root.confirmingRollback) root.rollbackCurrent()
           else root.removeCurrent()
         }
       }
